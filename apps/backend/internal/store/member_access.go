@@ -16,11 +16,12 @@ type MemberAccess struct {
 	TargetRole BusinessRole
 }
 
-func roleMayManageTarget(actor, target BusinessRole, permission BusinessPermission) bool {
-	if !roleAllows(actor, permission) {
+func roleMayManageTarget(actor, target BusinessRole, capability Capability) bool {
+	if !roleAllows(actor, capability) {
 		return false
 	}
-	if permission == PermissionManageEmployees || permission == PermissionManageDevices {
+	if capability == CapabilityMembersManage || capability == CapabilityDevicesManage ||
+		capability == CapabilityMembersPurge {
 		// Employee-management APIs never mutate the organization owner. Admins may
 		// manage managers/employees, but not peer admins.
 		if target == RoleOwner {
@@ -41,6 +42,8 @@ func memberAccessRows(ctx context.Context, q interface {
 		  FROM memberships target
 		  JOIN memberships actor ON actor.business_id = target.business_id
 		 WHERE actor.user_id = $1 AND target.user_id = $2
+		   AND actor.status = 'active'
+		   AND target.status = 'active'
 		 ORDER BY (actor.role = 'owner') DESC, target.created_at`, actorID, targetID)
 	if err != nil {
 		return MemberAccess{}, err
@@ -89,7 +92,9 @@ func memberAccessInBusiness(
 		    ON actor.business_id = target.business_id
 		 WHERE actor.user_id = $1
 		   AND target.user_id = $2
-		   AND target.business_id = $3`,
+		   AND target.business_id = $3
+		   AND actor.status = 'active'
+		   AND target.status = 'active'`,
 		actorID, targetID, businessID,
 	).Scan(&access.BusinessID, &access.ActorRole, &access.TargetRole)
 	if errors.Is(err, pgx.ErrNoRows) {

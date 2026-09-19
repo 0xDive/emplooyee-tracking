@@ -71,5 +71,13 @@
   "screenshots": "Ảnh chụp màn hình",
   "skipAppsCustom": "Tùy chỉnh",
   "skipAppsAddAll": "Thêm tất cả",
-  "skipAppsRemoveAll": "Xóa tất cả"
+  "skipAppsRemoveAll": "Xóa tất cả",
+  "screenshotScope": "Phạm vi ảnh chụp",
+  "screenshotScopeDesc": "Chọn chính xác nội dung được chụp.",
+  "scopeActiveWindow": "Cửa sổ đang hoạt động",
+  "scopeActiveWindowDesc": "Chỉ chụp cửa sổ ứng dụng ở phía trước.",
+  "scopeActiveDisplay": "Màn hình đang hoạt động",
+  "scopeActiveDisplayDesc": "Chụp màn hình chứa cửa sổ đang hoạt động.",
+  "scopeAllDisplays": "Tất cả màn hình",
+  "scopeAllDisplaysDesc": "Chụp từng màn hình được kết nối thành các ảnh riêng trong cùng một nhóm."
 }

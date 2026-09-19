@@ -71,5 +71,13 @@
   "screenshots": "截图",
   "skipAppsCustom": "自定义",
   "skipAppsAddAll": "全部添加",
-  "skipAppsRemoveAll": "全部移除"
+  "skipAppsRemoveAll": "全部移除",
+  "screenshotScope": "截图范围",
+  "screenshotScopeDesc": "选择要捕获的内容。",
+  "scopeActiveWindow": "活动窗口",
+  "scopeActiveWindowDesc": "仅捕获前台应用窗口。",
+  "scopeActiveDisplay": "活动显示器",
+  "scopeActiveDisplayDesc": "捕获前台窗口所在的显示器。",
+  "scopeAllDisplays": "所有显示器",
+  "scopeAllDisplaysDesc": "将每个已连接显示器分别捕获为同一组中的图像。"
 }

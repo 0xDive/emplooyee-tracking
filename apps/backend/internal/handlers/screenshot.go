@@ -54,6 +54,14 @@ func (h *ScreenshotHandler) Upload(c *gin.Context) {
 	if v := c.PostForm("business_id"); v != "" {
 		businessID = &v
 	}
+	var captureGroupID *string
+	if v := strings.TrimSpace(c.PostForm("capture_group_id")); v != "" {
+		if _, err := uuid.Parse(v); err != nil {
+			badRequest(c, "capture_group_id must be a uuid")
+			return
+		}
+		captureGroupID = &v
+	}
 
 	fileHeader, err := c.FormFile("image")
 	if err != nil {
@@ -90,29 +98,63 @@ func (h *ScreenshotHandler) Upload(c *gin.Context) {
 	}
 
 	monitoringEnabled, err := h.store.MembershipMonitoringEnabled(c.Request.Context(), userID, bizID)
-	if errors.Is(err, store.ErrNotFound) {
-		c.JSON(http.StatusForbidden, gin.H{"error": "membership is unavailable"})
+	switch {
+	case errors.Is(err, store.ErrMemberBlocked):
+		apiError(c, http.StatusForbidden, ErrCodeMemberBlocked, "organization access is suspended", nil)
 		return
-	}
-	if err != nil {
+	case errors.Is(err, store.ErrMemberRemoved):
+		apiError(c, http.StatusForbidden, ErrCodeMemberRemoved, "organization membership was removed", nil)
+		return
+	case errors.Is(err, store.ErrOrganizationArchived):
+		apiError(c, http.StatusConflict, ErrCodeOrganizationArchived, "organization is archived", nil)
+		return
+	case errors.Is(err, store.ErrOrganizationDeletionPending):
+		apiError(c, http.StatusConflict, ErrCodeOrganizationDeletionPending, "organization deletion is pending", nil)
+		return
+	case errors.Is(err, store.ErrNotFound), errors.Is(err, store.ErrMembershipUnavailable):
+		forbidden(c, "membership is unavailable")
+		return
+	case err != nil:
 		serverError(c, err)
 		return
 	}
 	if !monitoringEnabled {
-		c.JSON(http.StatusForbidden, gin.H{"error": "monitoring is disabled for this membership"})
+		forbidden(c, "monitoring is disabled for this membership")
 		return
 	}
 
 	// Screenshot uploads must obey the same device revocation policy as batch sync.
-	if err := h.store.TouchDevice(c.Request.Context(), userID, deviceID, store.DeviceMetadata{}); err != nil {
+	if err := h.store.TouchDevice(c.Request.Context(), userID, bizID, deviceID, store.DeviceMetadata{}); err != nil {
 		switch {
 		case errors.Is(err, store.ErrDeviceRevoked):
-			c.JSON(http.StatusForbidden, gin.H{"error": "this device was revoked by the administrator"})
+			apiError(c, http.StatusForbidden, ErrCodeDeviceRevoked, "this device was revoked by the administrator", nil)
+		case errors.Is(err, store.ErrDeviceLimitReached):
+			apiError(c, http.StatusConflict, ErrCodeDeviceLimitReached, "device limit reached", nil)
 		case errors.Is(err, store.ErrForbidden):
-			c.JSON(http.StatusForbidden, gin.H{"error": "device id belongs to another account"})
+			forbidden(c, "device id belongs to another account")
 		default:
 			serverError(c, err)
 		}
+		return
+	}
+
+	// Old desktop versions may still upload after screenshots are disabled. Treat
+	// such a row as acknowledged-but-discarded so it is never stored and the old
+	// agent does not retry forever.
+	policy, err := h.store.PolicyForUserInBusiness(c.Request.Context(), userID, bizID)
+	if err != nil {
+		switch {
+		case errors.Is(err, store.ErrMemberBlocked):
+			apiError(c, http.StatusForbidden, ErrCodeMemberBlocked, "organization access is suspended", nil)
+		case errors.Is(err, store.ErrMemberRemoved):
+			apiError(c, http.StatusForbidden, ErrCodeMemberRemoved, "organization membership was removed", nil)
+		default:
+			serverError(c, err)
+		}
+		return
+	}
+	if policy != nil && !policy.CollectScreenshots {
+		c.JSON(http.StatusOK, gin.H{"accepted": []string{clientUUID}})
 		return
 	}
 
@@ -134,6 +176,7 @@ func (h *ScreenshotHandler) Upload(c *gin.Context) {
 		Width:           optInt(c.PostForm("width")),
 		Height:          optInt(c.PostForm("height")),
 		DisplayID:       optInt(c.PostForm("display_id")),
+		CaptureGroupID:  captureGroupID,
 		ClientUpdatedAt: updatedAt,
 	}
 	if err := h.store.UpsertScreenshot(c.Request.Context(), userID, bizID, row); err != nil {
@@ -141,11 +184,24 @@ func (h *ScreenshotHandler) Upload(c *gin.Context) {
 			serverError(c, cleanupErr)
 			return
 		}
-		if errors.Is(err, store.ErrMembershipUnavailable) {
-			c.JSON(http.StatusForbidden, gin.H{"error": "membership is unavailable or monitoring is disabled"})
-			return
+		switch {
+		case errors.Is(err, store.ErrMemberBlocked):
+			apiError(c, http.StatusForbidden, ErrCodeMemberBlocked, "organization access is suspended", nil)
+		case errors.Is(err, store.ErrMemberRemoved):
+			apiError(c, http.StatusForbidden, ErrCodeMemberRemoved, "organization membership was removed", nil)
+		case errors.Is(err, store.ErrOrganizationArchived):
+			apiError(c, http.StatusConflict, ErrCodeOrganizationArchived, "organization is archived", nil)
+		case errors.Is(err, store.ErrOrganizationDeletionPending):
+			apiError(c, http.StatusConflict, ErrCodeOrganizationDeletionPending, "organization deletion is pending", nil)
+		case errors.Is(err, store.ErrMembershipUnavailable):
+			apiError(c, http.StatusForbidden, ErrCodePermissionDenied, "monitoring is disabled for this membership", nil)
+		case errors.Is(err, store.ErrCollectionDisabled):
+			// Policy may have changed after the pre-write check. The blob was already
+			// removed above; acknowledge the client UUID so an old agent does not retry.
+			c.JSON(http.StatusOK, gin.H{"accepted": []string{clientUUID}})
+		default:
+			serverError(c, err)
 		}
-		serverError(c, err)
 		return
 	}
 
@@ -156,9 +212,9 @@ func (h *ScreenshotHandler) resolveBusiness(c *gin.Context, userID string, expli
 	bizID, err := h.store.ResolveBusinessForUser(c.Request.Context(), userID, explicit)
 	switch {
 	case errors.Is(err, store.ErrNotFound):
-		c.JSON(http.StatusForbidden, gin.H{"error": "user belongs to no business"})
+		forbidden(c, "user belongs to no organization")
 	case errors.Is(err, store.ErrForbidden):
-		c.JSON(http.StatusForbidden, gin.H{"error": "not a member of that business"})
+		forbidden(c, "not a member of that organization")
 	case errors.Is(err, store.ErrAmbiguousBusiness):
 		badRequest(c, "multiple businesses: specify business_id")
 	case err != nil:

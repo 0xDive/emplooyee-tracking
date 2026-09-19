@@ -17,6 +17,12 @@ var ErrNotFound = errors.New("not found")
 // ErrConflict is returned on a unique-constraint violation (e.g. duplicate email).
 var ErrConflict = errors.New("conflict")
 
+var ErrMemberBlocked = errors.New("member blocked")
+var ErrMemberRemoved = errors.New("member removed")
+var ErrOrganizationArchived = errors.New("organization archived")
+var ErrOrganizationDeletionPending = errors.New("organization deletion pending")
+var ErrDeviceLimitReached = errors.New("device limit reached")
+
 // Store wraps the connection pool.
 type Store struct {
 	pool *pgxpool.Pool

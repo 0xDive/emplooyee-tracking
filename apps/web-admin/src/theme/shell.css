@@ -27,11 +27,13 @@
 }
 
 .ds-sidebar__brand {
+  position: relative;
   height: 38px;
   display: flex;
   align-items: center;
   padding: 0 4px;
 }
+
 
 .ds-brand-link {
   min-width: 0;
@@ -123,13 +125,35 @@
 }
 
 .ds-org-picker__eyebrow {
-  display: block;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  overflow: hidden;
   color: var(--ds-text-tertiary);
   font-size: 10px;
   font-weight: 650;
   line-height: 13px;
   text-transform: uppercase;
   letter-spacing: 0.055em;
+  white-space: nowrap;
+}
+
+.ds-org-picker__status {
+  overflow: hidden;
+  color: var(--ds-text-secondary);
+  letter-spacing: 0;
+  text-overflow: ellipsis;
+  text-transform: none;
+}
+
+.ds-org-picker__status::before {
+  content: "·";
+  margin-right: 4px;
+  color: var(--ds-text-tertiary);
+}
+
+.ds-org-picker__status--danger {
+  color: var(--ds-danger);
 }
 
 .ds-org-picker__name {
@@ -402,13 +426,13 @@
 }
 
 .ds-shell-topbar {
-  height: 56px;
-  flex: 0 0 56px;
+  height: 52px;
+  flex: 0 0 52px;
   padding: 0 24px;
   border-bottom: 1px solid var(--ds-border-subtle);
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: 10px;
   background: var(--ds-bg-surface);
 }
 
@@ -416,31 +440,15 @@
   flex: 0 0 auto;
 }
 
-.ds-shell-breadcrumb {
+.ds-shell-page-title {
   min-width: 0;
-  display: flex;
-  align-items: center;
-  gap: 7px;
-  color: var(--ds-text-tertiary);
-  font-size: var(--ds-text-sm);
-  line-height: 18px;
-}
-
-.ds-shell-breadcrumb__segment {
   overflow: hidden;
+  color: var(--ds-text-primary);
+  font-size: var(--ds-text-md);
+  font-weight: 700;
+  line-height: 20px;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-
-.ds-shell-breadcrumb__current {
-  color: var(--ds-text-secondary);
-  font-weight: 650;
-}
-
-.ds-shell-breadcrumb svg {
-  width: 14px;
-  height: 14px;
-  flex: 0 0 auto;
 }
 
 .ds-shell-content {
@@ -520,3 +528,10 @@
     transition: none;
   }
 }
+
+
+
+
+/* Production ActiLens brand mark. */
+.ds-brand-mark { border-radius: 0; background: transparent; color: inherit; }
+.ds-brand-mark img { display: block; width: 100%; height: 100%; object-fit: contain; }

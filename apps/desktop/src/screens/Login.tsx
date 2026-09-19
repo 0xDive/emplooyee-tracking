@@ -5,13 +5,29 @@ import { useTranslation } from "react-i18next";
 import { BrandMark } from "../ui";
 import { AuthTitleBar } from "../components/AuthTitleBar";
 import { LanguageSwitcher } from "../components/LanguageSwitcher";
+import { localizedApiError, stableApiErrorCode } from "../errorText";
 
 export type Session = {
   email: string;
   business_id?: string | null;
 };
 
-/* Inline icons (no icon dependency — matches the inline-mark style used elsewhere). */
+type OrganizationChoice = {
+  business_id: string;
+  business_name: string;
+  kind: string;
+  role: string;
+  status: string;
+};
+
+type LoginFlowResult = {
+  status: "authenticated" | "mfa_required" | "organization_required";
+  session?: Session;
+  challenge_token?: string;
+  business_id?: string | null;
+  organizations?: OrganizationChoice[];
+};
+
 const AtSignIcon = () => (
   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"
     strokeLinecap="round" strokeLinejoin="round" aria-hidden>
@@ -42,9 +58,6 @@ const BackIcon = () => (
   </svg>
 );
 
-/// Shown when the user picks "I have an account" on the welcome screen. The
-/// employee signs in with their pre-created account — the backend resolves their
-/// company from their membership, so there's nothing to pick.
 export function Login({
   onLoggedIn,
   onBack,
@@ -53,47 +66,112 @@ export function Login({
   onBack?: () => void;
 }) {
   const { t } = useTranslation("auth");
-  const [email, setEmail] = useState("");
+  const [identifier, setIdentifier] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
-  // Open the web signup wizard in the system browser (same as the Welcome screen).
+  const [mfaChallenge, setMfaChallenge] = useState<string | null>(null);
+  const [mfaBusinessId, setMfaBusinessId] = useState<string | null>(null);
+  const [mfaCode, setMfaCode] = useState("");
+  const [organizations, setOrganizations] = useState<OrganizationChoice[]>([]);
+
   async function openSignup() {
     try {
       const url = await invoke<string>("signup_url");
       await openUrl(url);
     } catch {
-      /* ignore — user can still sign in */
+      // User can still sign in.
     }
   }
 
-  async function signIn(e: React.FormEvent) {
-    e.preventDefault();
-    if (busy) return;
+  function handleResult(result: LoginFlowResult) {
+    if (result.status === "authenticated" && result.session) {
+      onLoggedIn(result.session);
+      return;
+    }
+    if (result.status === "mfa_required" && result.challenge_token) {
+      setOrganizations([]);
+      setMfaChallenge(result.challenge_token);
+      setMfaBusinessId(result.business_id || null);
+      setMfaCode("");
+      return;
+    }
+    if (result.status === "organization_required") {
+      setMfaChallenge(null);
+      setOrganizations(result.organizations || []);
+      return;
+    }
+    setError(t("login.unexpected"));
+  }
+
+  async function runPasswordLogin(businessId: string | null) {
     setError(null);
     setBusy(true);
     try {
-      // No business_id: the backend resolves the employee's company from their
-      // single membership.
-      const session = await invoke<Session>("login", {
-        email: email.trim(),
+      const result = await invoke<LoginFlowResult>("login", {
+        email: identifier.trim(),
         password,
-        businessId: null,
+        businessId,
       });
-      onLoggedIn(session);
+      handleResult(result);
     } catch (err) {
-      setError(String(err));
+      setError(localizedApiError(err, t("login.unexpected")));
     } finally {
       setBusy(false);
     }
   }
 
+  async function signIn(event: React.FormEvent) {
+    event.preventDefault();
+    if (busy) return;
+    await runPasswordLogin(null);
+  }
+
+  async function completeMFA(event: React.FormEvent) {
+    event.preventDefault();
+    if (busy || !mfaChallenge || !mfaCode.trim()) return;
+    setError(null);
+    setBusy(true);
+    try {
+      const result = await invoke<LoginFlowResult>("complete_mfa_login", {
+        challengeToken: mfaChallenge,
+        code: mfaCode.trim(),
+        email: identifier.trim(),
+        businessId: mfaBusinessId,
+      });
+      handleResult(result);
+    } catch (err) {
+      setError(
+        stableApiErrorCode(err) === "mfa_required"
+          ? t("mfa.invalid")
+          : localizedApiError(err, t("login.unexpected")),
+      );
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function resetToPassword() {
+    setError(null);
+    setMfaChallenge(null);
+    setMfaBusinessId(null);
+    setMfaCode("");
+    setOrganizations([]);
+  }
+
+  const choosingOrganization = organizations.length > 0;
+  const secondFactor = !!mfaChallenge;
+
   return (
     <div className="login welcome">
       <AuthTitleBar />
-      {onBack && (
-        <button type="button" className="welcome-back" onClick={onBack}>
+      {(onBack || secondFactor || choosingOrganization) && (
+        <button
+          type="button"
+          className="welcome-back"
+          onClick={secondFactor || choosingOrganization ? resetToPassword : onBack}
+        >
           <BackIcon />
           {t("login.back")}
         </button>
@@ -103,11 +181,12 @@ export function Login({
       </div>
 
       <BrandMark />
-      <form className="login-card" onSubmit={signIn}>
-        <h1 className="login-title">{t("login.title")}</h1>
-        <p className="login-sub">{t("login.subtitle")}</p>
 
-        <div className="auth-form">
+      {choosingOrganization ? (
+        <div className="login-card">
+          <h1 className="login-title">{t("organization.title")}</h1>
+          <p className="login-sub">{t("organization.subtitle")}</p>
+
           {error && (
             <div className="auth-err" role="alert">
               <AlertIcon />
@@ -115,67 +194,135 @@ export function Login({
             </div>
           )}
 
-          <label className="auth-field">
-            <span className="auth-field-lbl">{t("login.identifier")}</span>
-            <div className="auth-input">
-              <span className="auth-input-ic">
-                <AtSignIcon />
-              </span>
-              <input
-                type="text"
-                autoComplete="username"
-                value={email}
-                onChange={(e) => setEmail(e.target.value)}
-                placeholder="you@example.com"
-                autoFocus
-              />
-            </div>
-          </label>
-
-          <label className="auth-field">
-            <span className="auth-field-lbl">{t("login.password")}</span>
-            <div className="auth-input">
-              <span className="auth-input-ic">
-                <LockIcon />
-              </span>
-              <input
-                type="password"
-                autoComplete="current-password"
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                placeholder="••••••••"
-              />
-            </div>
-          </label>
-
-          {/* "Sign up on the web" link, right-aligned just under the password */}
-          <div className="auth-forgot-row">
-            <button type="button" className="auth-signup" onClick={openSignup}>
-              {t("login.signupLink")}
-              <svg
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="2.2"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                aria-hidden
+          <div className="persona-grid login-org-list">
+            {organizations.map((organization) => (
+              <button
+                key={organization.business_id}
+                type="button"
+                className="persona-card"
+                disabled={busy}
+                onClick={() => runPasswordLogin(organization.business_id)}
               >
-                <path d="M5 12h14" />
-                <path d="m12 5 7 7-7 7" />
-              </svg>
+                <span className="p-copy">
+                  <span className="p-title">{organization.business_name}</span>
+                  <span className="p-desc">
+                    {t(`organization.kind.${organization.kind}`)} ·{" "}
+                    {t(`organization.status.${organization.status}`)}
+                  </span>
+                </span>
+                <span className="p-action">→</span>
+              </button>
+            ))}
+          </div>
+        </div>
+      ) : secondFactor ? (
+        <form className="login-card" onSubmit={completeMFA}>
+          <h1 className="login-title">{t("mfa.title")}</h1>
+          <p className="login-sub">{t("mfa.subtitle")}</p>
+
+          <div className="auth-form">
+            {error && (
+              <div className="auth-err" role="alert">
+                <AlertIcon />
+                {error}
+              </div>
+            )}
+
+            <label className="auth-field">
+              <span className="auth-field-lbl">{t("mfa.code")}</span>
+              <div className="auth-input">
+                <span className="auth-input-ic"><LockIcon /></span>
+                <input
+                  type="text"
+                  inputMode="text"
+                  autoComplete="one-time-code"
+                  autoCapitalize="characters"
+                  spellCheck={false}
+                  value={mfaCode}
+                  onChange={(event) => setMfaCode(event.target.value)}
+                  placeholder={t("mfa.placeholder")}
+                  autoFocus
+                />
+              </div>
+            </label>
+
+            <p className="login-mfa-hint">{t("mfa.recoveryHint")}</p>
+
+            <button className="auth-btn" type="submit" disabled={busy || !mfaCode.trim()}>
+              {busy ? t("mfa.verifying") : t("mfa.verify")}
             </button>
           </div>
+        </form>
+      ) : (
+        <form className="login-card" onSubmit={signIn}>
+          <h1 className="login-title">{t("login.title")}</h1>
+          <p className="login-sub">{t("login.subtitle")}</p>
 
-          <button
-            className="auth-btn"
-            type="submit"
-            disabled={busy}
-          >
-            {busy ? t("login.submitting") : t("login.submit")}
-          </button>
-        </div>
-      </form>
+          <div className="auth-form">
+            {error && (
+              <div className="auth-err" role="alert">
+                <AlertIcon />
+                {error}
+              </div>
+            )}
+
+            <label className="auth-field">
+              <span className="auth-field-lbl">{t("login.identifier")}</span>
+              <div className="auth-input">
+                <span className="auth-input-ic"><AtSignIcon /></span>
+                <input
+                  type="text"
+                  autoComplete="username"
+                  value={identifier}
+                  onChange={(event) => setIdentifier(event.target.value)}
+                  placeholder="you@example.com"
+                  autoFocus
+                />
+              </div>
+            </label>
+
+            <label className="auth-field">
+              <span className="auth-field-lbl">{t("login.password")}</span>
+              <div className="auth-input">
+                <span className="auth-input-ic"><LockIcon /></span>
+                <input
+                  type="password"
+                  autoComplete="current-password"
+                  value={password}
+                  onChange={(event) => setPassword(event.target.value)}
+                  placeholder="••••••••"
+                />
+              </div>
+            </label>
+
+            <div className="auth-forgot-row">
+              <button type="button" className="auth-signup" onClick={openSignup}>
+                {t("login.signupLink")}
+                <svg
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2.2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  aria-hidden
+                >
+                  <path d="M5 12h14" />
+                  <path d="m12 5 7 7-7 7" />
+                </svg>
+              </button>
+            </div>
+
+            <button
+              className="auth-btn"
+              type="submit"
+              disabled={busy || !identifier.trim() || !password}
+            >
+              {busy ? t("login.submitting") : t("login.submit")}
+            </button>
+          </div>
+        </form>
+      )}
     </div>
   );
 }

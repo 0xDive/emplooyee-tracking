@@ -51,6 +51,8 @@
     "v1": {
       "subtitle": "Captured images for the selected period",
       "emptyDescription": "Screenshots will appear here when capture is enabled and the agent syncs them."
-    }
+    },
+    "captureGroup_one": "Capture {{time}} · {{count}} display",
+    "captureGroup_other": "Capture {{time}} · {{count}} displays"
   }
 }

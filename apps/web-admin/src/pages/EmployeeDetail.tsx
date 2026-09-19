@@ -3,6 +3,7 @@ import { Link, useParams, useSearchParams } from "react-router-dom";
 import { useTranslation } from "react-i18next";
 import {
   listBusinessEmployees,
+  listFormerMembers,
   reportActivity,
   reportBrowser,
   reportEmployees,
@@ -29,7 +30,13 @@ import {
   EmptyState,
   Skeleton,
 } from "../components/ds";
-import { dayRangeToUnix, fmtDuration, fmtRelative, isoDate } from "../format";
+import {
+  dayRangeToUnix,
+  fmtDuration,
+  fmtRelative,
+  isoDate,
+  isoDateInTimeZone,
+} from "../format";
 import { useBusinesses } from "../useBusinesses";
 import { memberTerms } from "../terms";
 import { useAuth } from "../auth/AuthContext";
@@ -46,10 +53,11 @@ function initials(name: string): string {
   return `${parts[0][0] || ""}${parts[parts.length - 1][0] || ""}`.toUpperCase();
 }
 
-type Presence = "active" | "idle" | "offline" | "blocked";
+type Presence = "active" | "idle" | "offline" | "blocked" | "removed";
 
 function presence(employee: Employee | null, report: ReportEmployee | null): Presence {
-  if (employee && !employee.active) return "blocked";
+  if (employee?.status === "removed") return "removed";
+  if (employee?.status === "blocked" || (employee && !employee.active)) return "blocked";
   const lastSeen = employee?.last_seen ?? report?.last_seen ?? null;
   if (!lastSeen) return "offline";
   const age = Math.max(0, Date.now() / 1000 - lastSeen);
@@ -83,13 +91,19 @@ export function EmployeeDetail() {
   const { id = "" } = useParams();
   const [params] = useSearchParams();
   const businessId = params.get("business");
+  const requestedFormer = params.get("former") === "1";
   const { businesses } = useBusinesses();
   const { user } = useAuth();
   const { setTitle } = useDetailHeader();
 
   const business = businesses.find((item) => item.id === businessId);
   const terms = memberTerms(business?.kind);
-  const mayManageDevices = canManageDevices(business?.role);
+  const isFormer = requestedFormer || false;
+  const organizationReadOnly = Boolean(
+    business?.archived_at || business?.deletion_scheduled_at,
+  );
+  const mayViewDevices = !isFormer && canManageDevices(business?.role);
+  const mayManageDevices = mayViewDevices && !organizationReadOnly;
 
   const [mode, setMode] = useState<"day" | "range">("day");
   const [day, setDay] = useState(() => isoDate(new Date()));
@@ -117,14 +131,24 @@ export function EmployeeDetail() {
     let cancelled = false;
     setIdentityLoading(true);
 
-    Promise.all([
-      reportEmployees(businessId),
-      listBusinessEmployees(businessId),
-    ])
-      .then(([report, live]) => {
+    const identityRequest = requestedFormer
+      ? listFormerMembers(businessId).then((former) => ({
+          report: null as ReportEmployee | null,
+          live: former.employees.find((item) => item.id === id) ?? null,
+        }))
+      : Promise.all([
+          reportEmployees(businessId),
+          listBusinessEmployees(businessId),
+        ]).then(([report, live]) => ({
+          report: report.employees.find((item) => item.id === id) ?? null,
+          live: live.employees.find((item) => item.id === id) ?? null,
+        }));
+
+    identityRequest
+      .then(({ report, live }) => {
         if (cancelled) return;
-        setEmployee(report.employees.find((item) => item.id === id) ?? null);
-        setLiveEmployee(live.employees.find((item) => item.id === id) ?? null);
+        setEmployee(report);
+        setLiveEmployee(live);
       })
       .catch(() => {
         if (!cancelled) setError(t("detail.errorIdentity"));
@@ -136,7 +160,7 @@ export function EmployeeDetail() {
     return () => {
       cancelled = true;
     };
-  }, [businessId, id, t]);
+  }, [businessId, id, requestedFormer, t]);
 
   useEffect(() => {
     setTitle(employee?.display_name ?? liveEmployee?.display_name ?? null);
@@ -144,10 +168,14 @@ export function EmployeeDetail() {
   }, [employee, liveEmployee, setTitle]);
 
   const loadReports = useCallback(async () => {
-    if (!id) return;
+    if (!id || !businessId) return;
 
     const [fromDate, toDate] = mode === "day" ? [day, day] : [from, to];
-    const range = dayRangeToUnix(fromDate, toDate);
+    const range = dayRangeToUnix(
+      fromDate,
+      toDate,
+      business?.timezone || "UTC",
+    );
 
     if (range.from > range.to) {
       setError(t("detail.errorStartAfterEnd"));
@@ -160,10 +188,10 @@ export function EmployeeDetail() {
     try {
       const [nextActivity, nextKeystrokes, nextBrowser, nextScreenshots] =
         await Promise.all([
-          reportActivity(id, range.from, range.to),
-          reportKeystrokes(id, range.from, range.to),
-          reportBrowser(id, range.from, range.to),
-          reportScreenshots(id, range.from, range.to),
+          reportActivity(businessId, id, range.from, range.to),
+          reportKeystrokes(businessId, id, range.from, range.to),
+          reportBrowser(businessId, id, range.from, range.to),
+          reportScreenshots(businessId, id, range.from, range.to),
         ]);
 
       setActivity(nextActivity);
@@ -175,13 +203,23 @@ export function EmployeeDetail() {
     } finally {
       setReportsLoading(false);
     }
-  }, [day, from, id, mode, t, to]);
+  }, [business?.timezone, businessId, day, from, id, mode, t, to]);
 
   useEffect(() => {
     loadReports();
   }, [loadReports]);
 
-  const today = isoDate(new Date());
+  const today = business?.timezone
+    ? isoDateInTimeZone(new Date(), business.timezone)
+    : isoDate(new Date());
+
+  useEffect(() => {
+    if (!business?.timezone) return;
+    const orgToday = isoDateInTimeZone(new Date(), business.timezone);
+    setDay(orgToday);
+    setFrom(orgToday);
+    setTo(orgToday);
+  }, [business?.timezone]);
 
   const summary = useMemo(() => {
     const activeSeconds =
@@ -214,7 +252,10 @@ export function EmployeeDetail() {
     "—";
   const isSelf = employee?.role === "owner" || employee?.id === user?.id;
   const state = presence(liveEmployee, employee);
-  const statusLabel = t(`employees.status.${state}`);
+  const statusLabel =
+    state === "removed"
+      ? t("employees.lifecycle.removed")
+      : t(`employees.status.${state}`);
   const lastSeen = liveEmployee?.last_seen ?? employee?.last_seen ?? null;
 
   const role = liveEmployee?.role ?? employee?.role;
@@ -225,7 +266,7 @@ export function EmployeeDetail() {
         ? t(`employees.roles.${role}`)
         : terms.one;
 
-  const tabs: Tab[] = mayManageDevices
+  const tabs: Tab[] = mayViewDevices
     ? ["overview", "activity", "screenshots", "browser", "devices"]
     : ["overview", "activity", "screenshots", "browser"];
 
@@ -538,7 +579,7 @@ export function EmployeeDetail() {
               {tab === "screenshots" && (
                 <Card>
                   {shots ? (
-                    <ScreenshotGallery shots={shots} />
+                    <ScreenshotGallery shots={shots} businessId={businessId} />
                   ) : (
                     <EmptyState title={t("detail.v1.noScreenshotData")} />
                   )}
@@ -552,8 +593,13 @@ export function EmployeeDetail() {
                   <EmptyState title={t("detail.v1.noBrowserData")} />
                 ))}
 
-              {tab === "devices" && mayManageDevices && (
-                <DevicesCard employeeId={id} businessId={businessId} />
+              {tab === "devices" && mayViewDevices && (
+                <DevicesCard
+                  employee={liveEmployee}
+                  employeeId={id}
+                  businessId={businessId}
+                  canChange={mayManageDevices}
+                />
               )}
             </>
           )}

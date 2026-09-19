@@ -36,20 +36,72 @@ export function fmtBytes(n: number): string {
   return `${(n / 1024 / 1024).toFixed(1)} MB`;
 }
 
-// Unix-second bounds for a YYYY-MM-DD date input (local time, inclusive end).
-export function dayRangeToUnix(fromDate: string, toDate: string): { from: number; to: number } {
-  const from = Math.floor(new Date(`${fromDate}T00:00:00`).getTime() / 1000);
-  const to = Math.floor(new Date(`${toDate}T23:59:59`).getTime() / 1000);
+function datePartsInTimeZone(date: Date, timeZone: string) {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hourCycle: "h23",
+  }).formatToParts(date);
+  const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  return {
+    year: Number(values.year),
+    month: Number(values.month),
+    day: Number(values.day),
+    hour: Number(values.hour),
+    minute: Number(values.minute),
+    second: Number(values.second),
+  };
+}
+
+function offsetAt(timestampMs: number, timeZone: string): number {
+  const p = datePartsInTimeZone(new Date(timestampMs), timeZone);
+  const localAsUtc = Date.UTC(p.year, p.month - 1, p.day, p.hour, p.minute, p.second);
+  return localAsUtc - Math.floor(timestampMs / 1000) * 1000;
+}
+
+function zonedMidnightMs(dateText: string, timeZone: string): number {
+  const [year, month, day] = dateText.split("-").map(Number);
+  const utcMidnight = Date.UTC(year, month - 1, day, 0, 0, 0);
+  let candidate = utcMidnight - offsetAt(utcMidnight, timeZone);
+  candidate = utcMidnight - offsetAt(candidate, timeZone);
+  return candidate;
+}
+
+function nextIsoDate(dateText: string): string {
+  const [year, month, day] = dateText.split("-").map(Number);
+  const next = new Date(Date.UTC(year, month - 1, day + 1));
+  return `${next.getUTCFullYear()}-${String(next.getUTCMonth() + 1).padStart(2, "0")}-${String(
+    next.getUTCDate(),
+  ).padStart(2, "0")}`;
+}
+
+// Unix-second bounds for organization-local calendar dates. The end is exclusive,
+// so DST days may legitimately contain 23 or 25 hours.
+export function dayRangeToUnix(
+  fromDate: string,
+  toDate: string,
+  timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC",
+): { from: number; to: number } {
+  const from = Math.floor(zonedMidnightMs(fromDate, timeZone) / 1000);
+  const to = Math.floor(zonedMidnightMs(nextIsoDate(toDate), timeZone) / 1000);
   return { from, to };
 }
 
+export function isoDateInTimeZone(
+  d: Date,
+  timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC",
+): string {
+  const p = datePartsInTimeZone(d, timeZone);
+  return `${p.year}-${String(p.month).padStart(2, "0")}-${String(p.day).padStart(2, "0")}`;
+}
+
 export function isoDate(d: Date): string {
-  // LOCAL date, not toISOString() (UTC) — for a UTC+7 viewer the UTC date is
-  // still yesterday between local midnight and 7am, which made the default day
-  // view (and its screenshot gallery) query an already-ended window.
-  const m = String(d.getMonth() + 1).padStart(2, "0");
-  const day = String(d.getDate()).padStart(2, "0");
-  return `${d.getFullYear()}-${m}-${day}`;
+  return isoDateInTimeZone(d);
 }
 
 export function daysAgoIso(n: number): string {

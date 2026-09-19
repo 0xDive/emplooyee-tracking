@@ -37,9 +37,66 @@ jobs:
           echo "version=$CANDIDATE" >> "$GITHUB_OUTPUT"
           echo "Release version: $CANDIDATE"
 
+  validate:
+    name: Validate release candidate
+    needs: prepare
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: actilens
+          POSTGRES_PASSWORD: actilens
+          POSTGRES_DB: actilens
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U actilens -d actilens"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: apps/backend/go.mod
+          cache-dependency-path: apps/backend/go.sum
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Enable pnpm
+        run: |
+          corepack enable
+          corepack prepare pnpm@10.30.1 --activate
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Validate RU/EN and light/dark UI contract
+        run: python3 scripts/check-ui-contract.py
+      - name: Typecheck and build web admin
+        run: |
+          pnpm --filter @actilens/web-admin typecheck
+          pnpm --filter @actilens/web-admin build
+      - name: Typecheck desktop UI
+        run: pnpm --filter @actilens/desktop typecheck
+      - name: Test and build backend
+        working-directory: apps/backend
+        run: |
+          go test ./...
+          go build ./cmd/server
+      - name: Run PostgreSQL acceptance and production-upgrade tests
+        working-directory: apps/backend
+        env:
+          ACTILENS_TEST_DATABASE_URL: postgres://actilens:actilens@127.0.0.1:5432/actilens?sslmode=disable
+        run: go test ./internal/store -count=1
+      - name: Validate deployment scripts
+        run: |
+          bash -n install-linux.sh
+          bash -n actilensctl.sh
+          bash -n scripts/set-version.sh
+
   windows:
     name: Build Windows installers
-    needs: prepare
+    needs: [prepare, validate]
     runs-on: windows-latest
     env:
       # Public releases are server-agnostic. Deployment selects the backend at
@@ -93,7 +150,7 @@ jobs:
 
   docker:
     name: Publish Docker image
-    needs: prepare
+    needs: [prepare, validate]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

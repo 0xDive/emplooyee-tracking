@@ -29,7 +29,12 @@ async function discover() {
       if (!res.ok) continue;
       const j = await res.json();
       if (j && j.app === "actilens" && j.token) {
-        const link = { port, token: j.token };
+        const link = {
+          port,
+          token: j.token,
+          managed: !!j.managed,
+          browserTrackingEnabled: j.browser_tracking_enabled !== false,
+        };
         await chrome.storage.local.set({ link });
         return link;
       }
@@ -101,6 +106,11 @@ async function getCurrent() {
 }
 
 async function isPaused() {
+  const link = await ensureLink();
+  if (link && link.managed) {
+    // Organization policy is authoritative in managed mode.
+    return !link.browserTrackingEnabled;
+  }
   const { paused } = await chrome.storage.local.get("paused");
   return !!paused;
 }
@@ -145,16 +155,22 @@ async function transition(url, title) {
 // Driven from the service worker so port/token discovery (postVisit) is reused.
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area !== "local" || !changes.paused) return;
-  const paused = !!changes.paused.newValue;
-  postVisit({
-    url: paused ? MARKER_OFF : MARKER_ON,
-    page_title: paused
-      ? "Tracking turned off in browser"
-      : "Tracking turned on in browser",
-    ts: now(),
-    browser: BROWSER,
-    duration_s: 0,
-  });
+  (async () => {
+    const link = await ensureLink();
+    // A managed installation cannot be paused from the extension popup.
+    if (link && link.managed) return;
+
+    const paused = !!changes.paused.newValue;
+    await postVisit({
+      url: paused ? MARKER_OFF : MARKER_ON,
+      page_title: paused
+        ? "Tracking turned off in browser"
+        : "Tracking turned on in browser",
+      ts: now(),
+      browser: BROWSER,
+      duration_s: 0,
+    });
+  })();
 });
 
 // ---------- events ----------

@@ -125,6 +125,10 @@ jobs:
                   "Legacy web-admin design usage found:\n" + "\n".join(hits)
               )
           PY
+      - name: Validate RU/EN and light/dark UI contract
+        run: python3 scripts/check-ui-contract.py
+      - name: Validate ActiLens brand integrity
+        run: python3 scripts/check-brand-assets.py
       - name: Validate Linux deployment scripts
         run: |
           bash -n bootstrap-linux.sh

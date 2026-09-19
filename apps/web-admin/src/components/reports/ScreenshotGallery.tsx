@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
 import { fetchImageObjectUrl } from "../../api/client";
@@ -15,9 +15,11 @@ function hhmmss(timestamp: number): string {
 
 function Shot({
   meta,
+  businessId,
   onOpen,
 }: {
   meta: ScreenshotMeta;
+  businessId: string;
   onOpen: () => void;
 }) {
   const { t } = useTranslation("reports");
@@ -29,7 +31,7 @@ function Shot({
     let objectUrl: string | null = null;
     setFailed(false);
 
-    fetchImageObjectUrl(meta.client_uuid)
+    fetchImageObjectUrl(meta.client_uuid, businessId)
       .then((nextUrl) => {
         objectUrl = nextUrl;
         if (alive) setUrl(nextUrl);
@@ -43,7 +45,7 @@ function Shot({
       alive = false;
       if (objectUrl) URL.revokeObjectURL(objectUrl);
     };
-  }, [meta.client_uuid]);
+  }, [businessId, meta.client_uuid]);
 
   return (
     <button
@@ -74,11 +76,13 @@ function Shot({
 
 function Lightbox({
   shots,
+  businessId,
   index,
   onIndex,
   onClose,
 }: {
   shots: ScreenshotMeta[];
+  businessId: string;
   index: number;
   onIndex: (index: number) => void;
   onClose: () => void;
@@ -94,7 +98,7 @@ function Lightbox({
     let alive = true;
     setUrl(null);
 
-    fetchImageObjectUrl(meta.client_uuid)
+    fetchImageObjectUrl(meta.client_uuid, businessId)
       .then((nextUrl) => {
         if (objectUrlRef.current) URL.revokeObjectURL(objectUrlRef.current);
         objectUrlRef.current = nextUrl;
@@ -110,7 +114,7 @@ function Lightbox({
         objectUrlRef.current = null;
       }
     };
-  }, [meta.client_uuid]);
+  }, [businessId, meta.client_uuid]);
 
   useEffect(() => {
     function onKeyDown(event: KeyboardEvent) {
@@ -186,9 +190,42 @@ function Lightbox({
   );
 }
 
-export function ScreenshotGallery({ shots }: { shots: ScreenshotMeta[] }) {
+export function ScreenshotGallery({
+  shots,
+  businessId,
+}: {
+  shots: ScreenshotMeta[];
+  businessId: string;
+}) {
   const { t } = useTranslation("reports");
   const [active, setActive] = useState<number | null>(null);
+  const groups = useMemo(() => {
+    const indexByUUID = new Map(
+      shots.map((shot, index) => [shot.client_uuid, index] as const),
+    );
+    const grouped = new Map<
+      string,
+      { key: string; grouped: boolean; shots: ScreenshotMeta[] }
+    >();
+    for (const shot of shots) {
+      const groupedCapture = Boolean(shot.capture_group_id);
+      const key = shot.capture_group_id ?? shot.client_uuid;
+      const current = grouped.get(key);
+      if (current) {
+        current.shots.push(shot);
+      } else {
+        grouped.set(key, {
+          key,
+          grouped: groupedCapture,
+          shots: [shot],
+        });
+      }
+    }
+    return {
+      items: [...grouped.values()],
+      indexByUUID,
+    };
+  }, [shots]);
 
   if (shots.length === 0) {
     return (
@@ -207,18 +244,49 @@ export function ScreenshotGallery({ shots }: { shots: ScreenshotMeta[] }) {
       </div>
 
       <div className="report-gallery">
-        {shots.map((shot, index) => (
-          <Shot
-            key={shot.client_uuid}
-            meta={shot}
-            onOpen={() => setActive(index)}
-          />
-        ))}
+        {groups.items.map((group) =>
+          group.grouped ? (
+            <section className="report-capture-group" key={group.key}>
+              <div className="report-capture-group__head">
+                <span>
+                  {t("screenshots.captureGroup", {
+                    time: hhmmss(group.shots[0].ts),
+                    count: group.shots.length,
+                  })}
+                </span>
+              </div>
+              <div className="report-capture-group__grid">
+                {group.shots.map((shot) => (
+                  <Shot
+                    key={shot.client_uuid}
+                    meta={shot}
+                    businessId={businessId}
+                    onOpen={() =>
+                      setActive(groups.indexByUUID.get(shot.client_uuid) ?? 0)
+                    }
+                  />
+                ))}
+              </div>
+            </section>
+          ) : (
+            <Shot
+              key={group.shots[0].client_uuid}
+              meta={group.shots[0]}
+              businessId={businessId}
+              onOpen={() =>
+                setActive(
+                  groups.indexByUUID.get(group.shots[0].client_uuid) ?? 0,
+                )
+              }
+            />
+          ),
+        )}
       </div>
 
       {active !== null && (
         <Lightbox
           shots={shots}
+          businessId={businessId}
           index={active}
           onIndex={setActive}
           onClose={() => setActive(null)}

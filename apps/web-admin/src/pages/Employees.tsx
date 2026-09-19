@@ -1,13 +1,18 @@
-import { useEffect, useRef, useState, type FormEvent, type ReactNode } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, type CSSProperties, type FormEvent, type ReactNode } from "react";
+import { createPortal } from "react-dom";
 import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import { Trans, useTranslation } from "react-i18next";
 import {
-  archiveEmployee,
+  blockMember,
   createBusiness,
   createEmployee,
   listBusinessEmployees,
-  resetEmployeePassword,
-  updateEmployee,
+  listFormerMembers,
+  removeMember,
+  resetManagedMemberPassword,
+  restoreMember,
+  unblockMember,
+  updateManagedMemberIdentity,
 } from "../api/endpoints";
 import { ApiError, type BusinessKind, type Employee } from "../api/types";
 import {
@@ -16,7 +21,7 @@ import {
   Dialog,
   EmptyState,
   IconButton,
-  PageHeader,
+  Badge,
   Skeleton,
   TextField,
 } from "../components/ds";
@@ -88,7 +93,7 @@ function initials(name: string): string {
 type Presence = "active" | "idle" | "offline" | "blocked";
 
 function presence(employee: Employee): Presence {
-  if (!employee.active) return "blocked";
+  if (employee.status === "blocked" || !employee.active) return "blocked";
   if (!employee.last_seen) return "offline";
   const age = Math.max(0, Date.now() / 1000 - employee.last_seen);
   if (age < 420) return "active";
@@ -105,26 +110,76 @@ function genTempPassword(): string {
   return out;
 }
 
-function useDismiss(open: boolean, close: () => void) {
-  const ref = useRef<HTMLDivElement>(null);
+function useAnchoredMenu(
+  open: boolean,
+  setOpen: (open: boolean) => void,
+) {
+  const anchorRef = useRef<HTMLButtonElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
+  const [style, setStyle] = useState<CSSProperties>({
+    position: "fixed",
+    top: 0,
+    left: 0,
+    visibility: "hidden",
+  });
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (!open) return;
+
+    const gap = 6;
+    const margin = 8;
+
+    function updatePosition() {
+      const anchor = anchorRef.current;
+      if (!anchor) return;
+
+      const rect = anchor.getBoundingClientRect();
+      const width = menuRef.current?.offsetWidth || 232;
+      const height = menuRef.current?.offsetHeight || 0;
+      const maxLeft = Math.max(margin, window.innerWidth - width - margin);
+      const left = Math.min(Math.max(margin, rect.right - width), maxLeft);
+      const below = rect.bottom + gap;
+      const above = rect.top - height - gap;
+      const maxTop = Math.max(margin, window.innerHeight - height - margin);
+      const top =
+        height > 0 && below + height > window.innerHeight - margin && above >= margin
+          ? above
+          : Math.min(Math.max(margin, below), maxTop);
+
+      setStyle({
+        position: "fixed",
+        top,
+        left,
+        zIndex: 1000,
+        visibility: "visible",
+      });
+    }
+
     function onPointerDown(event: MouseEvent) {
-      if (ref.current && !ref.current.contains(event.target as Node)) close();
+      const target = event.target as Node;
+      if (anchorRef.current?.contains(target) || menuRef.current?.contains(target)) return;
+      setOpen(false);
     }
+
     function onKeyDown(event: KeyboardEvent) {
-      if (event.key === "Escape") close();
+      if (event.key === "Escape") setOpen(false);
     }
+
+    const frame = requestAnimationFrame(updatePosition);
+    window.addEventListener("resize", updatePosition);
+    document.addEventListener("scroll", updatePosition, true);
     document.addEventListener("mousedown", onPointerDown);
     document.addEventListener("keydown", onKeyDown);
     return () => {
+      cancelAnimationFrame(frame);
+      window.removeEventListener("resize", updatePosition);
+      document.removeEventListener("scroll", updatePosition, true);
       document.removeEventListener("mousedown", onPointerDown);
       document.removeEventListener("keydown", onKeyDown);
     };
-  }, [open, close]);
+  }, [open, setOpen]);
 
-  return ref;
+  return { anchorRef, menuRef, style };
 }
 
 function EmployeesSkeleton() {
@@ -164,12 +219,13 @@ function EmployeeActionsMenu({
   const [editOpen, setEditOpen] = useState(false);
   const [passwordOpen, setPasswordOpen] = useState(false);
   const [statusOpen, setStatusOpen] = useState(false);
+  const [removeOpen, setRemoveOpen] = useState(false);
   const [editName, setEditName] = useState(employee.display_name);
   const [editLogin, setEditLogin] = useState(employee.email || employee.username || "");
   const [password, setPassword] = useState("");
   const [busy, setBusy] = useState(false);
   const [dialogError, setDialogError] = useState<string | null>(null);
-  const ref = useDismiss(open, () => setOpen(false));
+  const menu = useAnchoredMenu(open, setOpen);
 
   async function saveEdit() {
     const name = editName.trim();
@@ -182,7 +238,7 @@ function EmployeeActionsMenu({
       const patch = login.includes("@")
         ? { display_name: name, email: login, username: "" }
         : { display_name: name, username: login.toLowerCase(), email: "" };
-      await updateEmployee(employee.id, patch);
+      await updateManagedMemberIdentity(businessId, employee.id, patch);
       setEditOpen(false);
       setOpen(false);
       onChanged();
@@ -199,7 +255,7 @@ function EmployeeActionsMenu({
     setBusy(true);
     setDialogError(null);
     try {
-      await resetEmployeePassword(employee.id, password);
+      await resetManagedMemberPassword(businessId, employee.id, password);
       setPasswordOpen(false);
       setOpen(false);
       setPassword("");
@@ -211,12 +267,15 @@ function EmployeeActionsMenu({
     }
   }
 
-  async function toggleActive() {
+  async function toggleBlocked() {
     setBusy(true);
     setDialogError(null);
     try {
-      if (employee.active) await archiveEmployee(employee.id);
-      else await updateEmployee(employee.id, { active: true });
+      if (employee.status === "blocked") {
+        await unblockMember(businessId, employee.id);
+      } else {
+        await blockMember(businessId, employee.id);
+      }
       setStatusOpen(false);
       setOpen(false);
       onChanged();
@@ -228,9 +287,26 @@ function EmployeeActionsMenu({
     }
   }
 
+  async function removeFromOrganization() {
+    setBusy(true);
+    setDialogError(null);
+    try {
+      await removeMember(businessId, employee.id);
+      setRemoveOpen(false);
+      setOpen(false);
+      onChanged();
+      pushToast({ title: t("employees.lifecycle.removedToast"), tone: "success" });
+    } catch {
+      setDialogError(t("employees.prompts.failed"));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   return (
-    <div className="employees-actions" ref={ref}>
+    <div className="employees-actions">
       <IconButton
+        ref={menu.anchorRef}
         label={t("employees.actions.more")}
         onClick={(event) => {
           event.stopPropagation();
@@ -240,8 +316,13 @@ function EmployeeActionsMenu({
         <MoreIcon />
       </IconButton>
 
-      {open && (
-        <div className="ds-shell-popover employees-actions__menu" role="menu">
+      {open && createPortal(
+        <div
+          ref={menu.menuRef}
+          className="ds-shell-popover employees-actions__menu"
+          role="menu"
+          style={menu.style}
+        >
           <Link
             className="ds-menu__item"
             to={`/employees/${employee.id}?business=${businessId}`}
@@ -252,38 +333,42 @@ function EmployeeActionsMenu({
 
           {canManage && (
             <>
-              <EnrollmentTokenControl
-                employee={employee}
-                businessId={businessId}
-                canChange={canManage}
-                triggerVariant="menu-item"
-                onDialogClose={() => setOpen(false)}
-              />
-              <button
-                type="button"
-                className="ds-menu__item"
-                onClick={() => {
-                  setEditName(employee.display_name);
-                  setEditLogin(employee.email || employee.username || "");
-                  setOpen(false);
-                  setDialogError(null);
-                  setEditOpen(true);
-                }}
-              >
-                {t("employees.actions.edit")}
-              </button>
-              <button
-                type="button"
-                className="ds-menu__item"
-                onClick={() => {
-                  setOpen(false);
-                  setPassword("");
-                  setDialogError(null);
-                  setPasswordOpen(true);
-                }}
-              >
-                {t("employees.actions.password")}
-              </button>
+              {employee.status !== "blocked" && (
+                <>
+                  <EnrollmentTokenControl
+                    employee={employee}
+                    businessId={businessId}
+                    canChange
+                    triggerVariant="menu-item"
+                    onDialogClose={() => setOpen(false)}
+                  />
+                  <button
+                    type="button"
+                    className="ds-menu__item"
+                    onClick={() => {
+                      setEditName(employee.display_name);
+                      setEditLogin(employee.email || employee.username || "");
+                      setOpen(false);
+                      setDialogError(null);
+                      setEditOpen(true);
+                    }}
+                  >
+                    {t("employees.actions.edit")}
+                  </button>
+                  <button
+                    type="button"
+                    className="ds-menu__item"
+                    onClick={() => {
+                      setOpen(false);
+                      setPassword("");
+                      setDialogError(null);
+                      setPasswordOpen(true);
+                    }}
+                  >
+                    {t("employees.actions.password")}
+                  </button>
+                </>
+              )}
               <button
                 type="button"
                 className="ds-menu__item"
@@ -293,7 +378,18 @@ function EmployeeActionsMenu({
                   setStatusOpen(true);
                 }}
               >
-                {t(employee.active ? "employees.actions.archive" : "employees.actions.restore")}
+                {t(employee.status === "blocked" ? "employees.actions.restore" : "employees.actions.archive")}
+              </button>
+              <button
+                type="button"
+                className="ds-menu__item ds-menu__item--danger"
+                onClick={() => {
+                  setOpen(false);
+                  setDialogError(null);
+                  setRemoveOpen(true);
+                }}
+              >
+                {t("employees.actions.remove")}
               </button>
             </>
           )}
@@ -311,7 +407,8 @@ function EmployeeActionsMenu({
               />
             </>
           )}
-        </div>
+        </div>,
+        document.body,
       )}
 
       {editOpen && (
@@ -390,7 +487,7 @@ function EmployeeActionsMenu({
 
       {statusOpen && (
         <Dialog
-          title={t(employee.active ? "employees.actions.archive" : "employees.actions.restore")}
+          title={t(employee.status === "blocked" ? "employees.actions.restore" : "employees.actions.archive")}
           size="confirm"
           onClose={() => !busy && setStatusOpen(false)}
           closeOnBackdrop={!busy}
@@ -400,19 +497,182 @@ function EmployeeActionsMenu({
                 {t("newBusinessModal.cancel")}
               </Button>
               <Button
-                variant={employee.active ? "danger" : "primary"}
+                variant={employee.status === "blocked" ? "primary" : "danger"}
                 loading={busy}
-                onClick={toggleActive}
+                onClick={toggleBlocked}
               >
-                {t(employee.active ? "employees.actions.archive" : "employees.actions.restore")}
+                {t(employee.status === "blocked" ? "employees.actions.restore" : "employees.actions.archive")}
               </Button>
             </>
           }
         >
           <p className="employees-dialog-note">
-            {t(employee.active ? "employees.prompts.confirmArchive" : "employees.prompts.confirmRestore")}
+            {t(employee.status === "blocked" ? "employees.prompts.confirmRestore" : "employees.prompts.confirmArchive")}
           </p>
           {dialogError && <Alert tone="danger">{dialogError}</Alert>}
+        </Dialog>
+      )}
+
+      {removeOpen && (
+        <Dialog
+          title={t("employees.lifecycle.removeTitle", { name: employee.display_name })}
+          size="confirm"
+          onClose={() => !busy && setRemoveOpen(false)}
+          closeOnBackdrop={!busy}
+          footer={
+            <>
+              <Button variant="secondary" disabled={busy} onClick={() => setRemoveOpen(false)}>
+                {t("newBusinessModal.cancel")}
+              </Button>
+              <Button variant="danger" loading={busy} onClick={removeFromOrganization}>
+                {t("employees.actions.remove")}
+              </Button>
+            </>
+          }
+        >
+          <div className="employees-dialog-stack">
+            <Alert tone="warning">{t("employees.lifecycle.removeWarning")}</Alert>
+            <p className="employees-dialog-note">
+              {t("employees.lifecycle.removeScope")}
+            </p>
+            {dialogError && <Alert tone="danger">{dialogError}</Alert>}
+          </div>
+        </Dialog>
+      )}
+    </div>
+  );
+}
+
+function FormerMemberActions({
+  employee,
+  businessId,
+  canRestore,
+  canDelete,
+  onChanged,
+}: {
+  employee: Employee;
+  businessId: string;
+  canRestore: boolean;
+  canDelete: boolean;
+  onChanged: () => void;
+}) {
+  const { t } = useTranslation("dashboard");
+  const { pushToast } = useToast();
+  const [open, setOpen] = useState(false);
+  const [restoreOpen, setRestoreOpen] = useState(false);
+  const [monitoringEnabled, setMonitoringEnabled] = useState(true);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const menu = useAnchoredMenu(open, setOpen);
+
+  async function restore() {
+    setBusy(true);
+    setError(null);
+    try {
+      await restoreMember(businessId, employee.id, monitoringEnabled);
+      setRestoreOpen(false);
+      onChanged();
+      pushToast({ title: t("employees.lifecycle.restoredToast"), tone: "success" });
+    } catch {
+      setError(t("employees.prompts.failed"));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="employees-actions">
+      <IconButton
+        ref={menu.anchorRef}
+        label={t("employees.actions.more")}
+        onClick={(event) => {
+          event.stopPropagation();
+          setOpen((current) => !current);
+        }}
+      >
+        <MoreIcon />
+      </IconButton>
+
+      {open && createPortal(
+        <div
+          ref={menu.menuRef}
+          className="ds-shell-popover employees-actions__menu"
+          role="menu"
+          style={menu.style}
+        >
+          <Link
+            className="ds-menu__item"
+            to={`/employees/${employee.id}?business=${businessId}&former=1`}
+            onClick={() => setOpen(false)}
+          >
+            {t("employees.lifecycle.viewHistory")}
+          </Link>
+
+          {canRestore && (
+            <button
+              type="button"
+              className="ds-menu__item"
+              onClick={() => {
+                setOpen(false);
+                setError(null);
+                setMonitoringEnabled(true);
+                setRestoreOpen(true);
+              }}
+            >
+              {t("employees.lifecycle.restore")}
+            </button>
+          )}
+
+          {canDelete && (
+            <>
+              <div className="ds-menu__separator" />
+              <PermanentDeleteControl
+                employee={employee}
+                businessId={businessId}
+                canDelete={canDelete}
+                onDeleted={onChanged}
+                triggerVariant="menu-item"
+                onDialogClose={() => setOpen(false)}
+              />
+            </>
+          )}
+        </div>,
+        document.body,
+      )}
+
+      {restoreOpen && (
+        <Dialog
+          title={t("employees.lifecycle.restoreTitle", { name: employee.display_name })}
+          size="confirm"
+          onClose={() => !busy && setRestoreOpen(false)}
+          closeOnBackdrop={!busy}
+          footer={
+            <>
+              <Button variant="secondary" disabled={busy} onClick={() => setRestoreOpen(false)}>
+                {t("newBusinessModal.cancel")}
+              </Button>
+              <Button variant="primary" loading={busy} onClick={restore}>
+                {t("employees.lifecycle.restore")}
+              </Button>
+            </>
+          }
+        >
+          <div className="employees-dialog-stack">
+            <Alert tone="info">{t("employees.lifecycle.restoreInfo")}</Alert>
+            <label className="employees-monitoring-choice">
+              <input
+                type="checkbox"
+                checked={monitoringEnabled}
+                disabled={busy}
+                onChange={(event) => setMonitoringEnabled(event.currentTarget.checked)}
+              />
+              <span>
+                <strong>{t("employees.lifecycle.restoreMonitoring")}</strong>
+                <small>{t("employees.lifecycle.restoreMonitoringHelp")}</small>
+              </span>
+            </label>
+            {error && <Alert tone="danger">{error}</Alert>}
+          </div>
         </Dialog>
       )}
     </div>
@@ -500,10 +760,10 @@ function NewEmployeeDialog({
   onClose,
   onCreated,
 }: {
-  businessId: string | null;
+  businessId: string;
   terms: MemberTerms;
   onClose: () => void;
-  onCreated: (businessId: string, wasAutoCreated: boolean) => void;
+  onCreated: (businessId: string) => void;
 }) {
   const { t } = useTranslation("dashboard");
   const [login, setLogin] = useState("");
@@ -528,9 +788,9 @@ function NewEmployeeDialog({
         username: isEmail ? undefined : value.toLowerCase(),
         display_name: displayName.trim(),
         password,
-        business_id: businessId ?? undefined,
+        business_id: businessId,
       });
-      onCreated(result.business.id, businessId === null);
+      onCreated(result.business.id);
     } catch (err) {
       if (err instanceof ApiError) {
         if (err.status === 409) {
@@ -573,11 +833,6 @@ function NewEmployeeDialog({
       }
     >
       <form id="new-employee-form" className="employees-form" onSubmit={submit}>
-        {!businessId && (
-          <Alert tone="info">
-            {t("newEmployeeModal.noBusinessSelected", { member: terms.lowerOne })}
-          </Alert>
-        )}
         {error && <Alert tone="danger">{error}</Alert>}
 
         <TextField
@@ -644,14 +899,20 @@ export function Employees() {
   } = useBusinesses();
 
   const [employees, setEmployees] = useState<Employee[]>([]);
+  const [formerEmployees, setFormerEmployees] = useState<Employee[]>([]);
+  const [view, setView] = useState<"active" | "former">("active");
   const [loading, setLoading] = useState(false);
   const [listError, setListError] = useState<string | null>(null);
   const [showBusiness, setShowBusiness] = useState(false);
   const [showEmployee, setShowEmployee] = useState(false);
 
   const terms = memberTerms(selected?.kind);
-  const mayManageMembers = canManageMembers(selected?.role);
-  const mayManageRoles = canManageRoles(selected?.role);
+  const organizationReadOnly = Boolean(
+    selected?.archived_at || selected?.deletion_scheduled_at,
+  );
+  const mayViewFormer = canManageMembers(selected?.role);
+  const mayManageMembers = mayViewFormer && !organizationReadOnly;
+  const mayManageRoles = canManageRoles(selected?.role) && !organizationReadOnly;
 
   function loadEmployees(id: string) {
     setLoading(true);
@@ -664,10 +925,24 @@ export function Employees() {
       .finally(() => setLoading(false));
   }
 
+  function loadFormer(id: string) {
+    setLoading(true);
+    setListError(null);
+    listFormerMembers(id)
+      .then((result) => setFormerEmployees(result.employees))
+      .catch(() => setListError(t("employees.lifecycle.errorLoadFormer")))
+      .finally(() => setLoading(false));
+  }
+
   useEffect(() => {
-    if (selectedId) loadEmployees(selectedId);
-    else setEmployees([]);
-  }, [selectedId]);
+    if (!selectedId) {
+      setEmployees([]);
+      setFormerEmployees([]);
+      return;
+    }
+    if (view === "former") loadFormer(selectedId);
+    else loadEmployees(selectedId);
+  }, [selectedId, view]);
 
   const [searchParams, setSearchParams] = useSearchParams();
   useEffect(() => {
@@ -689,25 +964,47 @@ export function Employees() {
 
   return (
     <div className="employees-page">
-      <PageHeader
-        title={terms.many}
-        subtitle={
-          selected
-            ? `${selected.name} · ${t("employees.total", { count: employees.length })}`
-            : undefined
-        }
-        actions={
-          mayManageMembers ? (
-            <Button
-              variant="primary"
-              leadingIcon={<PlusIcon />}
-              onClick={() => setShowEmployee(true)}
-            >
-              {terms.addCta}
-            </Button>
-          ) : undefined
-        }
-      />
+      <div className="employees-toolbar">
+        <span className="employees-toolbar__count">
+          {selected
+            ? t("employees.total", {
+                count: view === "former" ? formerEmployees.length : employees.length,
+              })
+            : ""}
+        </span>
+        {mayManageMembers && (
+          <Button
+            variant="primary"
+            leadingIcon={<PlusIcon />}
+            onClick={() => setShowEmployee(true)}
+          >
+            {terms.addCta}
+          </Button>
+        )}
+      </div>
+
+      {selectedId && mayViewFormer && (
+        <div className="employees-view-tabs" role="tablist" aria-label={t("employees.lifecycle.viewLabel")}>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={view === "active"}
+            className={`employees-view-tab${view === "active" ? " is-active" : ""}`}
+            onClick={() => setView("active")}
+          >
+            {t("employees.lifecycle.activeMembers")}
+          </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={view === "former"}
+            className={`employees-view-tab${view === "former" ? " is-active" : ""}`}
+            onClick={() => setView("former")}
+          >
+            {t("employees.lifecycle.formerMembers")}
+          </button>
+        </div>
+      )}
 
       {!businessLoading && businesses.length === 0 && (
         <div style={{ marginBottom: 16 }}>
@@ -730,7 +1027,7 @@ export function Employees() {
 
       {(businessLoading || loading) && <EmployeesSkeleton />}
 
-      {!businessLoading && !loading && selectedId && employees.length === 0 && !listError && (
+      {view === "active" && !businessLoading && !loading && selectedId && employees.length === 0 && !listError && (
         <EmptyState
           title={t("employees.noMembersYet", { members: terms.lowerMany })}
           action={
@@ -743,7 +1040,7 @@ export function Employees() {
         />
       )}
 
-      {!loading && employees.length > 0 && selectedId && (
+      {view === "active" && !loading && employees.length > 0 && selectedId && (
         <div className="ds-table-wrap employees-table-wrap">
           <table className="ds-table employees-table">
             <thead>
@@ -760,9 +1057,12 @@ export function Employees() {
             <tbody>
               {employees.map((employee) => {
                 const state = presence(employee);
+                const isOwner = employee.role === "owner";
+                const isSelf = employee.id === selected?.owner_user_id;
                 const isPeerAdmin =
                   selected?.role === "admin" && employee.role === "admin";
-                const mayManageThis = mayManageMembers && !isPeerAdmin;
+                const mayManageThis = mayManageMembers && !isPeerAdmin && !isOwner;
+                const mayChangeRole = mayManageRoles && !isOwner;
                 const statusLabel = t(`employees.status.${state}`);
                 const showCurrentApp =
                   (state === "active" || state === "idle") && employee.current_app;
@@ -771,25 +1071,24 @@ export function Employees() {
                   <tr
                     key={employee.id}
                     className="employees-row"
-                    tabIndex={0}
                     onClick={(event) => {
+                      const target = event.target as HTMLElement;
+                      if (!event.currentTarget.contains(target)) return;
                       if (
-                        (event.target as HTMLElement).closest(
-                          "button, a, input, select, label",
+                        target.closest(
+                          "button, a, input, select, label, [role='button'], [role='option'], [data-no-row-nav]",
                         )
                       ) {
                         return;
                       }
                       navigate(`/employees/${employee.id}?business=${selectedId}`);
                     }}
-                    onKeyDown={(event) => {
-                      if (event.key === "Enter") {
-                        navigate(`/employees/${employee.id}?business=${selectedId}`);
-                      }
-                    }}
                   >
                     <td>
-                      <div className="employees-person">
+                      <Link
+                        className="employees-person employees-person-link"
+                        to={`/employees/${employee.id}?business=${selectedId}`}
+                      >
                         <span className="employees-avatar">
                           {initials(employee.display_name)}
                           <span
@@ -797,12 +1096,19 @@ export function Employees() {
                           />
                         </span>
                         <span className="employees-person__copy">
-                          <span className="employees-person__name">
-                            {employee.display_name}
+                          <span className="employees-person__name-row">
+                            <span className="employees-person__name">
+                              {employee.display_name}
+                            </span>
+                            {isSelf && (
+                              <Badge tone="neutral" className="employees-self-badge">
+                                {t("dashboard.selfBadge")}
+                              </Badge>
+                            )}
                           </span>
                           <span className="employees-person__status">{statusLabel}</span>
                         </span>
-                      </div>
+                      </Link>
                     </td>
                     <td className="employees-login">
                       {employee.email || employee.username || "—"}
@@ -811,7 +1117,7 @@ export function Employees() {
                       <MemberRoleControl
                         employee={employee}
                         businessId={selectedId}
-                        canChange={mayManageRoles}
+                        canChange={mayChangeRole && employee.status !== "blocked"}
                         onChanged={() => loadEmployees(selectedId)}
                       />
                     </td>
@@ -819,7 +1125,7 @@ export function Employees() {
                       <MemberMonitoringControl
                         employee={employee}
                         businessId={selectedId}
-                        canChange={mayManageThis}
+                        canChange={mayManageThis && employee.status !== "blocked"}
                         onChanged={() => loadEmployees(selectedId)}
                       />
                     </td>
@@ -843,13 +1149,91 @@ export function Employees() {
                         employee={employee}
                         businessId={selectedId}
                         canManage={mayManageThis}
-                        canDelete={mayManageRoles}
+                        canDelete={mayManageRoles && !isOwner}
                         onChanged={() => loadEmployees(selectedId)}
                       />
                     </td>
                   </tr>
                 );
               })}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {view === "former" && !loading && selectedId && formerEmployees.length === 0 && !listError && (
+        <EmptyState
+          title={t("employees.lifecycle.noFormer")}
+          description={t("employees.lifecycle.noFormerDescription")}
+        />
+      )}
+
+      {view === "former" && !loading && selectedId && formerEmployees.length > 0 && (
+        <div className="ds-table-wrap employees-table-wrap">
+          <table className="ds-table employees-table employees-table--former">
+            <thead>
+              <tr>
+                <th>{t("employees.table.name")}</th>
+                <th>{t("employees.table.login")}</th>
+                <th>{t("employees.table.role")}</th>
+                <th>{t("employees.lifecycle.removedAt")}</th>
+                <th>{t("employees.table.lastSeen")}</th>
+                <th aria-label={t("employees.actions.more")} />
+              </tr>
+            </thead>
+            <tbody>
+              {formerEmployees.map((employee) => (
+                <tr
+                  key={employee.id}
+                  className="employees-row employees-row--former"
+                  onClick={(event) => {
+                    const target = event.target as HTMLElement;
+                    if (!event.currentTarget.contains(target)) return;
+                    if (
+                      target.closest(
+                        "button, a, input, select, label, [role='button'], [role='option'], [data-no-row-nav]",
+                      )
+                    ) {
+                      return;
+                    }
+                    navigate(
+                      `/employees/${employee.id}?business=${selectedId}&former=1`,
+                    );
+                  }}
+                >
+                  <td>
+                    <Link
+                      className="employees-person employees-person-link"
+                      to={`/employees/${employee.id}?business=${selectedId}&former=1`}
+                    >
+                      <span className="employees-avatar employees-avatar--former">
+                        {initials(employee.display_name)}
+                      </span>
+                      <span className="employees-person__copy">
+                        <span className="employees-person__name">{employee.display_name}</span>
+                        <span className="employees-person__status">
+                          {t("employees.lifecycle.removed")}
+                        </span>
+                      </span>
+                    </Link>
+                  </td>
+                  <td className="employees-login">{employee.email || employee.username || "—"}</td>
+                  <td>{employee.role ? t(`employees.roles.${employee.role}`) : "—"}</td>
+                  <td className="employees-last-seen">
+                    {employee.removed_at ? new Date(employee.removed_at).toLocaleString() : "—"}
+                  </td>
+                  <td className="employees-last-seen">{relativeTime(employee.last_seen)}</td>
+                  <td>
+                    <FormerMemberActions
+                      employee={employee}
+                      businessId={selectedId}
+                      canRestore={mayManageMembers}
+                      canDelete={mayManageRoles}
+                      onChanged={() => loadFormer(selectedId)}
+                    />
+                  </td>
+                </tr>
+              ))}
             </tbody>
           </table>
         </div>
@@ -868,24 +1252,15 @@ export function Employees() {
         />
       )}
 
-      {showEmployee && mayManageMembers && (
+      {showEmployee && mayManageMembers && selectedId && (
         <NewEmployeeDialog
           businessId={selectedId}
           terms={terms}
           onClose={() => setShowEmployee(false)}
-          onCreated={async (newBusinessId, wasAutoCreated) => {
+          onCreated={async (businessId) => {
             setShowEmployee(false);
-            if (wasAutoCreated) {
-              await reloadBusinesses();
-              setSelectedId(newBusinessId);
-              pushToast({
-                title: t("employees.autoCreatedNote", { member: terms.lowerOne }),
-                tone: "success",
-              });
-            } else if (selectedId) {
-              loadEmployees(selectedId);
-              pushToast({ title: t("employees.prompts.saved"), tone: "success" });
-            }
+            loadEmployees(businessId);
+            pushToast({ title: t("employees.prompts.saved"), tone: "success" });
           }}
         />
       )}

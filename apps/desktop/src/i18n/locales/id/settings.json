@@ -71,5 +71,13 @@
   "screenshots": "Tangkapan layar",
   "skipAppsCustom": "Kustom",
   "skipAppsAddAll": "Tambah semua",
-  "skipAppsRemoveAll": "Hapus semua"
+  "skipAppsRemoveAll": "Hapus semua",
+  "screenshotScope": "Cakupan tangkapan layar",
+  "screenshotScopeDesc": "Pilih tepat apa yang akan ditangkap.",
+  "scopeActiveWindow": "Jendela aktif",
+  "scopeActiveWindowDesc": "Tangkap hanya jendela aplikasi di depan.",
+  "scopeActiveDisplay": "Layar aktif",
+  "scopeActiveDisplayDesc": "Tangkap layar yang berisi jendela aktif.",
+  "scopeAllDisplays": "Semua layar",
+  "scopeAllDisplaysDesc": "Tangkap setiap layar terhubung sebagai gambar terpisah dalam satu grup."
 }

@@ -492,6 +492,28 @@
   gap: 12px;
 }
 
+.report-capture-group {
+  grid-column: 1 / -1;
+  padding: 10px;
+  border: 1px solid var(--ds-border-subtle);
+  border-radius: var(--ds-radius-lg);
+  background: var(--ds-bg-subtle);
+}
+
+.report-capture-group__head {
+  margin-bottom: 9px;
+  color: var(--ds-text-secondary);
+  font-size: var(--ds-text-xs);
+  font-weight: 700;
+  line-height: 16px;
+}
+
+.report-capture-group__grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 10px;
+}
+
 .report-shot {
   position: relative;
   aspect-ratio: 16 / 10;
@@ -688,4 +710,28 @@
 .detail-dialog-stack {
   display: grid;
   gap: 16px;
+}
+
+.device-health-warning {
+  margin-bottom: 14px;
+}
+
+
+.device-card__head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.device-row__reenroll-hint {
+  color: var(--ds-text-tertiary);
+  font-size: var(--ds-text-xs);
+  font-weight: 500;
+}
+
+@media (max-width: 720px) {
+  .device-card__head {
+    flex-direction: column;
+  }
 }

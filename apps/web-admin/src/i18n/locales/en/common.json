@@ -45,6 +45,14 @@
       "lowerMany": "kids",
       "addCta": "Add kid",
       "org": "family"
+    },
+    "other": {
+      "one": "Member",
+      "many": "Members",
+      "lowerOne": "member",
+      "lowerMany": "members",
+      "addCta": "Add member",
+      "org": "organization"
     }
   },
   "shell": {
@@ -52,6 +60,29 @@
     "collapse": "Collapse navigation",
     "expand": "Expand navigation",
     "context": "Page context",
-    "appearance": "Appearance"
+    "appearance": "Appearance",
+    "account": "Account & security",
+    "archived": "Archived",
+    "deletionPending": "Deletion scheduled"
+  },
+  "errors": {
+    "validation_error": "Check the entered values and try again.",
+    "authentication_required": "Please sign in to continue.",
+    "reauth_required": "Confirm your current password to continue.",
+    "mfa_required": "Enter a valid authenticator or recovery code.",
+    "permission_denied": "You do not have permission to do that.",
+    "not_found": "The requested item was not found.",
+    "conflict": "This change conflicts with the current state. Refresh and try again.",
+    "member_blocked": "This organization membership is suspended.",
+    "member_removed": "This organization membership has been removed.",
+    "organization_archived": "This organization is archived and read-only.",
+    "organization_deletion_pending": "This organization is scheduled for deletion and is read-only.",
+    "device_limit_reached": "The organization device limit has been reached. Revoke a device or increase the limit.",
+    "device_revoked": "This device has been revoked by an administrator.",
+    "identifier_taken": "That email or username is already in use.",
+    "session_revoked": "Your session is no longer valid. Please sign in again.",
+    "rate_limited": "Too many requests. Try again shortly.",
+    "internal_error": "Something went wrong on the server. Try again.",
+    "retention_confirmation_required": "Preview the retention impact and confirm the reduction first."
   }
 }

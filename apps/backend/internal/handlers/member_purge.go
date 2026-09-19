@@ -44,9 +44,13 @@ func (h *MemberPurgeHandler) Purge(c *gin.Context) {
 	)
 	switch {
 	case errors.Is(err, store.ErrForbidden):
-		c.JSON(http.StatusForbidden, gin.H{"error": "only the organization owner can permanently delete this member"})
+		forbidden(c, "only the organization owner can permanently delete this member")
 	case errors.Is(err, store.ErrNotFound):
-		c.JSON(http.StatusNotFound, gin.H{"error": "member not found"})
+		notFound(c, "member not found")
+	case errors.Is(err, store.ErrOrganizationArchived):
+		apiError(c, http.StatusConflict, ErrCodeOrganizationArchived, "organization is archived", nil)
+	case errors.Is(err, store.ErrOrganizationDeletionPending):
+		apiError(c, http.StatusConflict, ErrCodeOrganizationDeletionPending, "organization deletion is pending", nil)
 	case err != nil:
 		// Screenshot deletion happens before DB row deletion while the membership
 		// is exclusively locked. RemoveAll is idempotent, so retry is safe even

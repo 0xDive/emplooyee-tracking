@@ -71,5 +71,13 @@
   "screenshots": "Screenshots",
   "skipAppsCustom": "Custom",
   "skipAppsAddAll": "Add all",
-  "skipAppsRemoveAll": "Remove all"
+  "skipAppsRemoveAll": "Remove all",
+  "screenshotScope": "Screenshot scope",
+  "screenshotScopeDesc": "Choose exactly what is captured.",
+  "scopeActiveWindow": "Active window",
+  "scopeActiveWindowDesc": "Capture only the foreground application window.",
+  "scopeActiveDisplay": "Active display",
+  "scopeActiveDisplayDesc": "Capture the display containing the foreground window.",
+  "scopeAllDisplays": "All displays",
+  "scopeAllDisplaysDesc": "Capture every connected display as separate images in one capture group."
 }

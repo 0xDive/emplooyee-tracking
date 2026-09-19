@@ -14,7 +14,7 @@ import { memberTerms } from "../terms";
 import { DetailHeaderContext } from "../detailHeader";
 import { canManageSettings } from "../rbac";
 import { LOCALES } from "../i18n";
-import { cx, IconButton } from "./ds";
+import { cx, IconButton, SelectMenu } from "./ds";
 
 const SIDEBAR_KEY = "actilens.admin.sidebarCollapsed";
 
@@ -74,12 +74,6 @@ const ChevronDownIcon = () => (
   </Icon>
 );
 
-const ChevronRightIcon = () => (
-  <Icon size={14}>
-    <path d="m9 18 6-6-6-6" />
-  </Icon>
-);
-
 const CheckIcon = () => (
   <Icon size={16}>
     <path d="m5 12 4 4L19 6" />
@@ -112,9 +106,7 @@ const CollapseIcon = ({ collapsed }: { collapsed: boolean }) => (
 function BrandMark() {
   return (
     <span className="ds-brand-mark" aria-hidden>
-      <Icon size={20}>
-        <path d="M4 12h4l2-5 4 10 2-5h4" />
-      </Icon>
+      <img src="/brand/mark.svg" alt="" />
     </span>
   );
 }
@@ -150,6 +142,7 @@ function useDismiss(open: boolean, close: () => void) {
 
 function OrganizationPicker() {
   const { t } = useTranslation("dashboard");
+  const { t: tCommon } = useTranslation("common");
   const navigate = useNavigate();
   const { businesses, selected, selectedId, setSelectedId } = useBusinesses();
   const [open, setOpen] = useState(false);
@@ -168,7 +161,18 @@ function OrganizationPicker() {
       >
         <span className="ds-org-picker__mark">{initials(selected.name)}</span>
         <span className="ds-org-picker__copy">
-          <span className="ds-org-picker__eyebrow">{t("dashboard.organization", { defaultValue: "Workspace" })}</span>
+          <span className="ds-org-picker__eyebrow">
+            <span>{t("dashboard.organization", { defaultValue: "Workspace" })}</span>
+            {selected.deletion_scheduled_at ? (
+              <span className="ds-org-picker__status ds-org-picker__status--danger">
+                {tCommon("shell.deletionPending")}
+              </span>
+            ) : selected.archived_at ? (
+              <span className="ds-org-picker__status">
+                {tCommon("shell.archived")}
+              </span>
+            ) : null}
+          </span>
           <span className="ds-org-picker__name">{selected.name}</span>
         </span>
         <span className="ds-org-picker__chevron">
@@ -220,6 +224,7 @@ function OrganizationPicker() {
 
 function AccountMenu() {
   const { t, i18n } = useTranslation();
+  const navigate = useNavigate();
   const { user, logout } = useAuth();
   const { mode, setMode } = useTheme();
   const [open, setOpen] = useState(false);
@@ -290,19 +295,31 @@ function AccountMenu() {
             <label className="ds-account-menu__label" htmlFor="shell-language">
               {t("language")}
             </label>
-            <select
+            <SelectMenu
               id="shell-language"
-              className="ds-language-select"
               value={locale}
-              onChange={(event) => i18n.changeLanguage(event.currentTarget.value)}
-            >
-              {LOCALES.map((item) => (
-                <option key={item.code} value={item.code}>
-                  {item.label}
-                </option>
-              ))}
-            </select>
+              ariaLabel={t("language")}
+              options={LOCALES.map((item) => ({
+                value: item.code,
+                label: item.label,
+              }))}
+              onChange={(value) => void i18n.changeLanguage(value)}
+            />
           </div>
+
+          <div className="ds-menu__separator" />
+
+          <button
+            type="button"
+            className="ds-menu__item"
+            onClick={() => {
+              setOpen(false);
+              navigate("/account");
+            }}
+          >
+            <SettingsIcon />
+            {t("shell.account")}
+          </button>
 
           <div className="ds-menu__separator" />
 
@@ -343,10 +360,15 @@ export function AppShell() {
   const activeNav = nav.find((item) =>
     item.end ? location.pathname === item.to : location.pathname.startsWith(item.to),
   );
-
   const isDetail = /^\/employees\/[^/]+/.test(location.pathname);
   const [detailTitle, setDetailTitle] = useState<string | null>(null);
   const detailHeader = useMemo(() => ({ setTitle: setDetailTitle }), []);
+
+  const currentTitle = isDetail
+    ? detailTitle || terms.one
+    : location.pathname.startsWith("/account")
+      ? t("shell.account")
+      : activeNav?.label || t("nav.dashboard");
 
   function toggleSidebar() {
     setCollapsed((current) => {
@@ -355,10 +377,6 @@ export function AppShell() {
       return next;
     });
   }
-
-  const breadcrumbCurrent = isDetail
-    ? detailTitle || terms.one
-    : activeNav?.label || t("nav.dashboard");
 
   return (
     <div className="ds-app-shell" data-sidebar={collapsed ? "collapsed" : "expanded"}>
@@ -402,24 +420,7 @@ export function AppShell() {
           >
             <CollapseIcon collapsed={collapsed} />
           </IconButton>
-
-          <div className="ds-shell-breadcrumb" aria-label={t("shell.context")}>
-            {selected && (
-              <>
-                <span className="ds-shell-breadcrumb__segment">{selected.name}</span>
-                <ChevronRightIcon />
-              </>
-            )}
-            {isDetail && (
-              <>
-                <span className="ds-shell-breadcrumb__segment">{terms.many}</span>
-                <ChevronRightIcon />
-              </>
-            )}
-            <span className="ds-shell-breadcrumb__segment ds-shell-breadcrumb__current">
-              {breadcrumbCurrent}
-            </span>
-          </div>
+          <div className="ds-shell-page-title">{currentTitle}</div>
         </header>
 
         <div className="ds-shell-content">

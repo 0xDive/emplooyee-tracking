@@ -19,6 +19,7 @@ import { Welcome } from "./screens/Welcome";
 import { Onboarding } from "./screens/Onboarding";
 import { LanguageSwitcher } from "./components/LanguageSwitcher";
 import { AppTrayMenu } from "./components/AppTrayMenu";
+import brandMark from "./assets/brand-mark.svg";
 
 type Screen =
   | "Dashboard"
@@ -305,12 +306,15 @@ function App() {
   }
 
   async function toggleTracking() {
-    // Paused -> resume; tracking or idle -> pause.
+    // Managed organization tracking is server-controlled and cannot be paused locally.
+    if (captureManaged?.managed) return;
     const pause = status !== "paused";
     const prev = status;
     setStatus(pause ? "paused" : "tracking");
     try {
       await invoke("set_paused", { paused: pause });
+      const actual = await invoke<TrackStatus>("tracking_state");
+      setStatus(actual);
     } catch {
       setStatus(prev);
     }
@@ -377,19 +381,20 @@ function App() {
     <div className="app">
       <div className="app-titlebar" onMouseDown={dragWindow}>
         <span className="app-titlebar-title">ActiLens — {t(`nav.${screen}`)}</span>
-        <AppTrayMenu status={status} onToggleTracking={toggleTracking} />
+        <AppTrayMenu
+          status={status}
+          locked={captureManaged?.managed === true}
+          onToggleTracking={toggleTracking}
+        />
       </div>
       <div className="app-body">
       <aside className="sidebar">
         <div className="brand">
           <span className="brand-logo" aria-hidden>
-            <svg viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-              <circle cx="12" cy="12" r="9" />
-              <path d="M4.5 12 h3.2 l1.8 -4.4 l2.4 8.8 l1.8 -4.4 h4.5" />
-            </svg>
+            <img src={brandMark} alt="" />
           </span>
           <span className="brand-text">
-            <span className="brand-name">Bi<span className="brand-accent">Bo</span>Tracking</span>
+            <span className="brand-name">Acti<span className="brand-accent">Lens</span></span>
             {version && <span className="brand-version">v{version}</span>}
           </span>
         </div>
@@ -465,6 +470,7 @@ function App() {
               <button
                 className={`bb-trackpill ${trackClass}`}
                 onClick={toggleTracking}
+                disabled={captureManaged?.managed === true}
                 aria-label={pillTitle}
               >
                 {status === "paused" ? <PauseBars /> : <span className="bb-trackpill__dot" />}

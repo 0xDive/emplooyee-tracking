@@ -62,6 +62,35 @@ func (s *Store) Write(businessID, userID string, ts int64, clientUUID string, da
 	return rel, nil
 }
 
+// WriteExport stores one generated organization export under a UUID-only path.
+// extension is an internal value selected by the exporter, never client input.
+func (s *Store) WriteExport(businessID, exportID, extension string, data []byte) (string, error) {
+	for _, id := range []string{businessID, exportID} {
+		if _, err := uuid.Parse(id); err != nil {
+			return "", errors.New("path component is not a uuid")
+		}
+	}
+	switch extension {
+	case "csv", "json", "zip":
+	default:
+		return "", errors.New("unsupported export extension")
+	}
+	rel := filepath.Join("exports", businessID, exportID+"."+extension)
+	abs := filepath.Join(s.root, rel)
+	if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
+		return "", err
+	}
+	tmp := abs + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+		return "", err
+	}
+	if err := os.Rename(tmp, abs); err != nil {
+		_ = os.Remove(tmp)
+		return "", err
+	}
+	return rel, nil
+}
+
 // Open opens a stored screenshot by its DB-recorded relative path. The path is
 // cleaned and confined to the storage root, so a tampered DB value still can't
 // escape it.
@@ -72,6 +101,23 @@ func (s *Store) Open(rel string) (*os.File, error) {
 		return nil, errors.New("path escapes storage root")
 	}
 	return os.Open(abs)
+}
+
+// RemoveBusinessData removes organization-owned screenshot and generated-export
+// trees. The business id is UUID-validated before any recursive deletion.
+func (s *Store) RemoveBusinessData(businessID string) error {
+	if _, err := uuid.Parse(businessID); err != nil {
+		return errors.New("path component is not a uuid")
+	}
+	for _, dir := range []string{
+		filepath.Join(s.root, "screenshots", businessID),
+		filepath.Join(s.root, "exports", businessID),
+	} {
+		if err := os.RemoveAll(dir); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // RemoveMemberScreenshots deletes the entire screenshot subtree for one

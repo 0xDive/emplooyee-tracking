@@ -33,21 +33,41 @@ func (s *Store) CreateEnrollmentToken(ctx context.Context, actorID, businessID, 
 	}
 
 	var targetRole BusinessRole
+	var memberStatus string
 	var active bool
 	var authVersion int
+	var archived, deletionPending bool
 	err = tx.QueryRow(ctx, `
-		SELECT m.role, u.active, u.auth_version
+		SELECT m.role, m.status, u.active, u.auth_version,
+		       b.archived_at IS NOT NULL,
+		       b.deletion_scheduled_at IS NOT NULL
 		  FROM memberships m
 		  JOIN users u ON u.id = m.user_id
+		  JOIN businesses b ON b.id = m.business_id
 		 WHERE m.business_id = $1 AND m.user_id = $2
-		 FOR UPDATE OF m, u`, businessID, targetUserID).Scan(&targetRole, &active, &authVersion)
+		 FOR UPDATE OF m, u, b`,
+		businessID, targetUserID,
+	).Scan(&targetRole, &memberStatus, &active, &authVersion, &archived, &deletionPending)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return "", ErrNotFound
 	}
 	if err != nil {
 		return "", err
 	}
-	if !roleMayManageTarget(actorRole, targetRole, PermissionManageEmployees) || !active {
+	if deletionPending {
+		return "", ErrOrganizationDeletionPending
+	}
+	if archived {
+		return "", ErrOrganizationArchived
+	}
+	if memberStatus == MemberStatusBlocked {
+		return "", ErrMemberBlocked
+	}
+	if memberStatus == MemberStatusRemoved {
+		return "", ErrMemberRemoved
+	}
+	if memberStatus != MemberStatusActive ||
+		!roleMayManageTarget(actorRole, targetRole, PermissionManageEmployees) || !active {
 		return "", ErrForbidden
 	}
 
@@ -101,12 +121,16 @@ func (s *Store) RedeemEnrollmentToken(ctx context.Context, tokenHash string) (En
 		  FROM enrollment_tokens et
 		  JOIN users u ON u.id = et.user_id
 		  JOIN memberships m ON m.user_id = et.user_id AND m.business_id = et.business_id
+		  JOIN businesses b ON b.id = et.business_id
 		 WHERE et.token_hash = $1
 		   AND et.used_at IS NULL
 		   AND et.revoked_at IS NULL
 		   AND et.expires_at > now()
 		   AND et.auth_version = u.auth_version
 		   AND u.active = true
+		   AND m.status = 'active'
+		   AND b.archived_at IS NULL
+		   AND b.deletion_scheduled_at IS NULL
 		 FOR UPDATE OF et`, tokenHash).Scan(
 		&tokenID, &grant.BusinessID, &grant.AuthVersion,
 		&grant.User.ID, &grant.User.Email, &grant.User.Username, &grant.User.DisplayName, &grant.User.AccountType,

@@ -1,26 +1,43 @@
 package handlers
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"strings"
+	"time"
 
 	"actilens/backend/internal/auth"
+	"actilens/backend/internal/events"
 	"actilens/backend/internal/obs"
 	"actilens/backend/internal/store"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 )
 
 // AuthHandler serves registration, login, refresh, and the public picker.
 type AuthHandler struct {
-	store *store.Store
-	tok   *auth.Manager
+	store     *store.Store
+	tok       *auth.Manager
+	publisher events.Publisher
 }
 
 // NewAuthHandler wires the auth handler.
 func NewAuthHandler(s *store.Store, tok *auth.Manager) *AuthHandler {
-	return &AuthHandler{store: s, tok: tok}
+	return &AuthHandler{store: s, tok: tok, publisher: events.Discard{}}
+}
+
+func (h *AuthHandler) SetEventPublisher(publisher events.Publisher) {
+	if publisher != nil {
+		h.publisher = publisher
+	}
+}
+
+func (h *AuthHandler) publish(ctx context.Context, event events.Event) {
+	if h.publisher != nil {
+		h.publisher.Publish(ctx, event)
+	}
 }
 
 type registerReq struct {
@@ -29,6 +46,8 @@ type registerReq struct {
 	Password    string `json:"password"`
 	DisplayName string `json:"display_name"`
 	AccountType string `json:"account_type"` // 'manager' (default) | 'parent'
+	ClientType  string `json:"client_type"`
+	ClientLabel string `json:"client_label"`
 }
 
 // Register creates a new account (any user can be an owner) and returns tokens.
@@ -72,14 +91,14 @@ func (h *AuthHandler) Register(c *gin.Context) {
 	}
 	u, err := h.store.CreateUser(c.Request.Context(), req.Email, req.Username, hash, req.DisplayName, req.AccountType)
 	if errors.Is(err, store.ErrConflict) {
-		c.JSON(http.StatusConflict, gin.H{"error": "that email or username is already taken"})
+		apiError(c, http.StatusConflict, ErrCodeIdentifierTaken, "that email or username is already taken", nil)
 		return
 	}
 	if err != nil {
 		serverError(c, err)
 		return
 	}
-	h.issue(c, http.StatusCreated, u)
+	h.issue(c, http.StatusCreated, u, req.ClientType, req.ClientLabel, "")
 }
 
 type loginReq struct {
@@ -87,6 +106,8 @@ type loginReq struct {
 	Email      string `json:"email"`      // legacy field; treated as an identifier
 	Password   string `json:"password"`
 	BusinessID string `json:"business_id"` // optional: employee picking their company
+	ClientType string `json:"client_type"`
+	ClientLabel string `json:"client_label"`
 }
 
 // Login verifies credentials and returns tokens. If business_id is supplied, the
@@ -119,18 +140,74 @@ func (h *AuthHandler) Login(c *gin.Context) {
 		return
 	}
 
-	if req.BusinessID != "" {
-		member, err := h.store.IsMember(c.Request.Context(), u.ID, req.BusinessID)
+	resolvedBusinessID := strings.TrimSpace(req.BusinessID)
+	if req.ClientType == "desktop" {
+		organizations, err := h.store.LoginOrganizations(c.Request.Context(), u.ID)
+		if err != nil {
+			serverError(c, err)
+			return
+		}
+		if resolvedBusinessID == "" {
+			switch len(organizations) {
+			case 0:
+				// Standalone account: no managed organization binding.
+			case 1:
+				resolvedBusinessID = organizations[0].BusinessID
+			default:
+				apiError(c, http.StatusConflict, ErrCodeOrganizationRequired, "organization selection required", gin.H{
+					"organizations": organizations,
+				})
+				return
+			}
+		} else {
+			found := false
+			for _, organization := range organizations {
+				if organization.BusinessID == resolvedBusinessID {
+					found = true
+					break
+				}
+			}
+			if !found {
+				forbidden(c, "not an active or blocked member of that organization")
+				return
+			}
+		}
+	} else if resolvedBusinessID != "" {
+		member, err := h.store.IsMember(c.Request.Context(), u.ID, resolvedBusinessID)
 		if err != nil {
 			serverError(c, err)
 			return
 		}
 		if !member {
-			c.JSON(http.StatusForbidden, gin.H{"error": "not a member of that business"})
+			forbidden(c, "not a member of that organization")
 			return
 		}
 	}
-	h.issue(c, http.StatusOK, u)
+
+	mfaState, err := h.store.MFAState(c.Request.Context(), u.ID)
+	if err != nil {
+		serverError(c, err)
+		return
+	}
+	if mfaState.Enabled {
+		_, version, err := h.store.UserSecurity(c.Request.Context(), u.ID)
+		if err != nil {
+			serverError(c, err)
+			return
+		}
+		challenge, err := h.tok.IssueMFAChallenge(u.ID, version)
+		if err != nil {
+			serverError(c, err)
+			return
+		}
+		c.Header("Cache-Control", "no-store")
+		apiError(c, http.StatusUnauthorized, ErrCodeMFARequired, "multi-factor authentication required", gin.H{
+			"challenge_token": challenge,
+			"business_id":     resolvedBusinessID,
+		})
+		return
+	}
+	h.issue(c, http.StatusOK, u, req.ClientType, req.ClientLabel, resolvedBusinessID)
 }
 
 type refreshReq struct {
@@ -144,7 +221,7 @@ func (h *AuthHandler) Refresh(c *gin.Context) {
 		badRequest(c, "invalid body")
 		return
 	}
-	userID, tokenVersion, err := h.tok.ParseRefreshVersioned(req.RefreshToken)
+	userID, tokenVersion, sessionID, err := h.tok.ParseRefreshSession(req.RefreshToken)
 	if err != nil {
 		unauthorized(c, "invalid refresh token")
 		return
@@ -154,12 +231,42 @@ func (h *AuthHandler) Refresh(c *gin.Context) {
 		unauthorized(c, "invalid refresh token")
 		return
 	}
-	pair, err := h.tok.IssueVersioned(userID, currentVersion)
+
+	// Legacy refresh tokens did not carry a session id. Migrate them into a
+	// first-class session on first successful refresh.
+	if sessionID == "" {
+		sessionID = uuid.NewString()
+		pair, err := h.tok.IssueSessionVersioned(userID, currentVersion, sessionID)
+		if err != nil {
+			serverError(c, err)
+			return
+		}
+		if err := h.store.CreateAuthSession(
+			c.Request.Context(), userID, sessionID, auth.HashToken(pair.RefreshToken),
+			"web", "Migrated session", currentVersion, time.Now().UTC().Add(auth.RefreshTTL()),
+		); err != nil {
+			serverError(c, err)
+			return
+		}
+		obs.Info("legacy session migrated", "user", userID, "session", sessionID)
+		c.JSON(http.StatusOK, pair)
+		return
+	}
+
+	pair, err := h.tok.IssueSessionVersioned(userID, currentVersion, sessionID)
 	if err != nil {
 		serverError(c, err)
 		return
 	}
-	obs.Info("login ok", "user", userID)
+	if err := h.store.RotateAuthSession(
+		c.Request.Context(), userID, sessionID,
+		auth.HashToken(req.RefreshToken), auth.HashToken(pair.RefreshToken),
+		currentVersion, time.Now().UTC().Add(auth.RefreshTTL()),
+	); err != nil {
+		apiError(c, http.StatusUnauthorized, ErrCodeSessionRevoked, "session revoked", nil)
+		return
+	}
+	obs.Info("session refreshed", "user", userID, "session", sessionID)
 	c.JSON(http.StatusOK, pair)
 }
 
@@ -194,7 +301,12 @@ func (h *AuthHandler) Me(c *gin.Context) {
 	})
 }
 
-func (h *AuthHandler) issue(c *gin.Context, status int, u store.User) {
+func (h *AuthHandler) issue(
+	c *gin.Context,
+	status int,
+	u store.User,
+	clientType, clientLabel, businessID string,
+) {
 	active, version, err := h.store.UserSecurity(c.Request.Context(), u.ID)
 	if err != nil {
 		serverError(c, err)
@@ -204,8 +316,16 @@ func (h *AuthHandler) issue(c *gin.Context, status int, u store.User) {
 		unauthorized(c, "invalid credentials")
 		return
 	}
-	pair, err := h.tok.IssueVersioned(u.ID, version)
+	sessionID := uuid.NewString()
+	pair, err := h.tok.IssueSessionVersioned(u.ID, version, sessionID)
 	if err != nil {
+		serverError(c, err)
+		return
+	}
+	if err := h.store.CreateAuthSession(
+		c.Request.Context(), u.ID, sessionID, auth.HashToken(pair.RefreshToken),
+		clientType, clientLabel, version, time.Now().UTC().Add(auth.RefreshTTL()),
+	); err != nil {
 		serverError(c, err)
 		return
 	}
@@ -217,6 +337,7 @@ func (h *AuthHandler) issue(c *gin.Context, status int, u store.User) {
 			"display_name": u.DisplayName,
 			"account_type": u.AccountType,
 		},
-		"tokens": pair,
+		"tokens":      pair,
+		"business_id": businessID,
 	})
 }

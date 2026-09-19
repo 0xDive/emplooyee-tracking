@@ -71,5 +71,13 @@
   "screenshots": "Скриншоты",
   "skipAppsCustom": "Свои",
   "skipAppsAddAll": "Добавить все",
-  "skipAppsRemoveAll": "Удалить все"
+  "skipAppsRemoveAll": "Удалить все",
+  "screenshotScope": "Область захвата",
+  "screenshotScopeDesc": "Выберите, что именно попадёт в скриншот.",
+  "scopeActiveWindow": "Активное окно",
+  "scopeActiveWindowDesc": "Снимать только окно активного приложения.",
+  "scopeActiveDisplay": "Активный монитор",
+  "scopeActiveDisplayDesc": "Снимать монитор, на котором находится активное окно.",
+  "scopeAllDisplays": "Все мониторы",
+  "scopeAllDisplaysDesc": "Снимать каждый подключённый монитор отдельным изображением одной группы."
 }

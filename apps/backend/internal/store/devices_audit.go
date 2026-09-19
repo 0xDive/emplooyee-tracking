@@ -27,11 +27,13 @@ type DeviceMetadata struct {
 type Device struct {
 	ID         string `json:"id"`
 	UserID     string `json:"user_id"`
+	BusinessID string `json:"business_id"`
 	Label      string `json:"label"`
 	Hostname   string `json:"hostname"`
 	Platform   string `json:"platform"`
 	Arch       string `json:"arch"`
-	AppVersion string `json:"app_version"`
+	AppVersion     string `json:"app_version"`
+	VersionStatus  string `json:"version_status"`
 	FirstSeen  int64  `json:"first_seen"`
 	LastSeen   *int64 `json:"last_seen"`
 	RevokedAt  *int64 `json:"revoked_at"`
@@ -53,6 +55,7 @@ type AuditEvent struct {
 const deviceColumns = `
 	d.id,
 	d.user_id,
+	COALESCE(d.business_id::text, ''),
 	COALESCE(d.label, ''),
 	COALESCE(d.hostname, ''),
 	COALESCE(d.platform, ''),
@@ -65,7 +68,7 @@ const deviceColumns = `
 func scanDevice(row scanner) (Device, error) {
 	var d Device
 	err := row.Scan(
-		&d.ID, &d.UserID, &d.Label, &d.Hostname, &d.Platform, &d.Arch,
+		&d.ID, &d.UserID, &d.BusinessID, &d.Label, &d.Hostname, &d.Platform, &d.Arch,
 		&d.AppVersion, &d.FirstSeen, &d.LastSeen, &d.RevokedAt,
 	)
 	return d, err
@@ -82,60 +85,124 @@ func optionalText(v *string) any {
 	return s
 }
 
-// touchDeviceTx creates or refreshes a device without ever allowing a device UUID
-// to move between user accounts. A revoked UUID stays revoked until an owner restores it.
-func touchDeviceTx(ctx context.Context, tx pgx.Tx, userID, deviceID string, meta DeviceMetadata) error {
-	ct, err := tx.Exec(ctx, `
+// touchDeviceTx creates or refreshes a device and binds it to exactly one
+// organization. Existing unbound migration-era devices may bind on their first
+// explicit sync. A UUID can never move between users or organizations.
+func touchDeviceTx(
+	ctx context.Context,
+	tx pgx.Tx,
+	userID, businessID, deviceID string,
+	meta DeviceMetadata,
+) error {
+	updateExisting := func() (bool, error) {
+		var existingUser string
+		var existingBusiness *string
+		var revoked bool
+		err := tx.QueryRow(ctx, `
+			SELECT user_id, business_id::text, revoked_at IS NOT NULL
+			  FROM devices
+			 WHERE id = $1
+			 FOR UPDATE`,
+			deviceID,
+		).Scan(&existingUser, &existingBusiness, &revoked)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		if existingUser != userID {
+			return true, ErrForbidden
+		}
+		if revoked {
+			return true, ErrDeviceRevoked
+		}
+		if existingBusiness != nil && *existingBusiness != businessID {
+			return true, ErrForbidden
+		}
+		_, err = tx.Exec(ctx, `
+			UPDATE devices
+			   SET business_id = COALESCE(business_id, $1),
+			       label = COALESCE($2, label),
+			       hostname = COALESCE($3, hostname),
+			       platform = COALESCE($4, platform),
+			       arch = COALESCE($5, arch),
+			       app_version = COALESCE($6, app_version),
+			       last_seen_at = now()
+			 WHERE id = $7`,
+			businessID,
+			optionalText(meta.Label), optionalText(meta.Hostname),
+			optionalText(meta.Platform), optionalText(meta.Arch),
+			optionalText(meta.AppVersion), deviceID,
+		)
+		return true, err
+	}
+
+	if found, err := updateExisting(); found || err != nil {
+		return err
+	}
+
+	// Serialize first-seen devices for this organization so concurrent enrollments
+	// cannot both pass the configured organization-wide active-device limit.
+	var limit *int
+	if err := tx.QueryRow(ctx, `
+		SELECT device_limit
+		  FROM businesses
+		 WHERE id = $1
+		 FOR UPDATE`,
+		businessID,
+	).Scan(&limit); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
+		return err
+	}
+
+	// Another concurrent sync may have inserted this UUID while we waited.
+	if found, err := updateExisting(); found || err != nil {
+		return err
+	}
+
+	if limit != nil {
+		var count int
+		if err := tx.QueryRow(ctx, `
+			SELECT count(*)
+			  FROM devices
+			 WHERE business_id = $1
+			   AND revoked_at IS NULL`,
+			businessID,
+		).Scan(&count); err != nil {
+			return err
+		}
+		if count >= *limit {
+			return ErrDeviceLimitReached
+		}
+	}
+
+	_, err := tx.Exec(ctx, `
 		INSERT INTO devices
-			(id, user_id, label, hostname, platform, arch, app_version, last_seen_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, now())
-		ON CONFLICT (id) DO UPDATE SET
-			label = COALESCE(EXCLUDED.label, devices.label),
-			hostname = COALESCE(EXCLUDED.hostname, devices.hostname),
-			platform = COALESCE(EXCLUDED.platform, devices.platform),
-			arch = COALESCE(EXCLUDED.arch, devices.arch),
-			app_version = COALESCE(EXCLUDED.app_version, devices.app_version),
-			last_seen_at = now()
-		WHERE devices.user_id = EXCLUDED.user_id
-		  AND devices.revoked_at IS NULL`,
-		deviceID, userID, optionalText(meta.Label), optionalText(meta.Hostname),
+			(id, user_id, business_id, label, hostname, platform, arch, app_version, last_seen_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,now())`,
+		deviceID, userID, businessID,
+		optionalText(meta.Label), optionalText(meta.Hostname),
 		optionalText(meta.Platform), optionalText(meta.Arch), optionalText(meta.AppVersion),
 	)
-	if err != nil {
-		return err
-	}
-	if ct.RowsAffected() > 0 {
-		return nil
-	}
-
-	var existingUser string
-	var revoked bool
-	err = tx.QueryRow(ctx,
-		`SELECT user_id, revoked_at IS NOT NULL FROM devices WHERE id = $1`, deviceID,
-	).Scan(&existingUser, &revoked)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return ErrNotFound
-	}
-	if err != nil {
-		return err
-	}
-	if existingUser != userID {
-		return ErrForbidden
-	}
-	if revoked {
-		return ErrDeviceRevoked
-	}
-	return ErrConflict
+	return err
 }
 
-// TouchDevice refreshes last_seen for screenshot-only syncs and enforces revocation.
-func (s *Store) TouchDevice(ctx context.Context, userID, deviceID string, meta DeviceMetadata) error {
+// TouchDevice refreshes last_seen for screenshot-only syncs and enforces
+// organization binding, revocation, and device limits.
+func (s *Store) TouchDevice(
+	ctx context.Context,
+	userID, businessID, deviceID string,
+	meta DeviceMetadata,
+) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback(ctx)
-	if err := touchDeviceTx(ctx, tx, userID, deviceID, meta); err != nil {
+	if err := touchDeviceTx(ctx, tx, userID, businessID, deviceID, meta); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)
@@ -170,10 +237,16 @@ func (s *Store) ListEmployeeDevices(ctx context.Context, actorID, employeeID str
 		return nil, err
 	}
 
-	rows, err := s.pool.Query(ctx, `SELECT `+deviceColumns+`
+	query := `SELECT `+deviceColumns+`
 		FROM devices d
-		WHERE d.user_id = $1
-		ORDER BY d.revoked_at NULLS FIRST, d.last_seen_at DESC NULLS LAST, d.first_seen_at DESC`, employeeID)
+		WHERE d.user_id = $1`
+	args := []any{employeeID}
+	if len(businessID) > 0 && strings.TrimSpace(businessID[0]) != "" {
+		query += ` AND d.business_id = $2`
+		args = append(args, strings.TrimSpace(businessID[0]))
+	}
+	query += ` ORDER BY d.revoked_at NULLS FIRST, d.last_seen_at DESC NULLS LAST, d.first_seen_at DESC`
+	rows, err := s.pool.Query(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -221,6 +294,9 @@ func (s *Store) UpdateDevice(ctx context.Context, actorID, deviceID string, labe
 	if err != nil {
 		return Device{}, err
 	}
+	if err := lockMutableOrganizationTx(ctx, tx, access.BusinessID); err != nil {
+		return Device{}, err
+	}
 
 	nextLabel := currentLabel
 	if label != nil {
@@ -229,6 +305,37 @@ func (s *Store) UpdateDevice(ctx context.Context, actorID, deviceID string, labe
 	nextRevoked := currentRevoked
 	if revoked != nil {
 		nextRevoked = *revoked
+	}
+
+	if currentRevoked && !nextRevoked {
+		if access.BusinessID == "" {
+			return Device{}, ErrForbidden
+		}
+		var limit *int
+		if err := tx.QueryRow(ctx, `
+			SELECT device_limit
+			  FROM businesses
+			 WHERE id = $1
+			 FOR UPDATE`, access.BusinessID,
+		).Scan(&limit); err != nil {
+			return Device{}, err
+		}
+		if limit != nil {
+			var count int
+			if err := tx.QueryRow(ctx, `
+				SELECT count(*)
+				  FROM devices
+				 WHERE business_id = $1
+				   AND revoked_at IS NULL
+				   AND id <> $2`,
+				access.BusinessID, deviceID,
+			).Scan(&count); err != nil {
+				return Device{}, err
+			}
+			if count >= *limit {
+				return Device{}, ErrDeviceLimitReached
+			}
+		}
 	}
 
 	row := tx.QueryRow(ctx, `UPDATE devices d
@@ -314,6 +421,44 @@ func (s *Store) ListAuditEvents(ctx context.Context, actorID, businessID string,
 			}
 		}
 		out = append(out, ev)
+	}
+	return out, rows.Err()
+}
+
+
+func (s *Store) ListBusinessActiveDevices(
+	ctx context.Context,
+	actorID, businessID string,
+) ([]Device, error) {
+	if err := s.BusinessPermissionOrForbidden(
+		ctx, actorID, businessID, CapabilityDevicesView,
+	); err != nil {
+		return nil, err
+	}
+	rows, err := s.pool.Query(ctx, `
+		SELECT `+deviceColumns+`
+		  FROM devices d
+		  JOIN memberships m
+		    ON m.user_id = d.user_id
+		   AND m.business_id = d.business_id
+		 WHERE d.business_id = $1
+		   AND d.revoked_at IS NULL
+		   AND m.status = 'active'
+		 ORDER BY d.last_seen_at DESC NULLS LAST, d.first_seen_at DESC`,
+		businessID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := []Device{}
+	for rows.Next() {
+		device, err := scanDevice(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, device)
 	}
 	return out, rows.Err()
 }

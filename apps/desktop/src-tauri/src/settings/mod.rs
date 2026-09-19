@@ -21,6 +21,14 @@ pub struct Settings {
     pub screenshot_retention_days: u64,
     /// Store only the site origin for browser visits, not the full URL.
     pub domain_only: bool,
+    /// Organization-controlled identifying/detail collection switches. Active/idle
+    /// remains mandatory in managed mode even when app identity is disabled.
+    #[serde(default = "default_true")]
+    pub collect_app_activity: bool,
+    #[serde(default = "default_true")]
+    pub collect_window_titles: bool,
+    #[serde(default = "default_true")]
+    pub collect_browser_activity: bool,
     /// Run as a menu-bar-only app (no Dock icon).
     #[serde(default)]
     pub hide_dock: bool,
@@ -32,6 +40,14 @@ pub struct Settings {
     /// captured. Pre-rename values ("full_screen"/"active_window") still parse.
     #[serde(default = "default_screenshot_mode")]
     pub screenshot_mode: String,
+    /// Explicit screenshot scope: active_window | active_display | all_displays.
+    /// Missing on older settings files and normalized from screenshot_mode on load.
+    #[serde(default)]
+    pub screenshot_capture_scope: String,
+    /// Last server-confirmed privacy rules. Cached locally so an offline restart
+    /// keeps the same pre-capture exclusions instead of widening capture.
+    #[serde(default)]
+    pub screenshot_privacy_rules: Vec<crate::sync::client::PrivacyRule>,
     /// App names for which the capture tick is skipped entirely while that app is
     /// frontmost (case-insensitive whole-word match on the active window's app
     /// name). Prefilled with the curated sensitive-app rules; user-editable.
@@ -48,6 +64,15 @@ pub struct Settings {
     /// local with no backend account. Skips the login screen entirely. Default off.
     #[serde(default)]
     pub local_only: bool,
+    /// Last organization whose managed collection owned newly-created local rows.
+    /// Kept across logout so re-auth to the same organization does not discard an
+    /// offline managed backlog.
+    #[serde(default)]
+    pub last_managed_business_id: Option<String>,
+    /// True when local/unbound collection may have created rows since the last
+    /// managed scope. The next managed binding suppresses those pending rows.
+    #[serde(default)]
+    pub collection_scope_dirty: bool,
     /// First-run onboarding flow finished (welcome → toggles → permissions). Default
     /// off so onboarding shows once per install.
     #[serde(default)]
@@ -149,13 +174,20 @@ impl Default for Settings {
             screenshot_interval_s: DEFAULT_SCREENSHOT_INTERVAL_S,
             screenshot_retention_days: DEFAULT_RETENTION_DAYS,
             domain_only: false,
+            collect_app_activity: true,
+            collect_window_titles: true,
+            collect_browser_activity: true,
             hide_dock: false,
             capture_screenshots: true,
             screenshot_mode: default_screenshot_mode(),
+            screenshot_capture_scope: "active_window".into(),
+            screenshot_privacy_rules: Vec::new(),
             screenshot_skip_apps: default_skip_apps(),
             count_keystrokes: true,
             consented: false,
             local_only: false,
+            last_managed_business_id: None,
+            collection_scope_dirty: false,
             onboarding_completed: false,
             device_id: String::new(),
             locale: default_locale(),
@@ -164,12 +196,36 @@ impl Default for Settings {
     }
 }
 
+impl Settings {
+    /// Whether pending local rows must be quarantined before binding to a managed
+    /// organization. An unknown previous scope alone is not enough: clean installs
+    /// and upgrades with no local-mode activity must not lose legitimate backlog.
+    pub fn needs_managed_scope_suppression(&self, business_id: &str) -> bool {
+        self.local_only
+            || self.collection_scope_dirty
+            || self
+                .last_managed_business_id
+                .as_deref()
+                .is_some_and(|previous| previous != business_id)
+    }
+}
+
 /// Load settings from `path`, falling back to defaults if missing/invalid.
 pub fn load(path: &Path) -> Settings {
-    std::fs::read_to_string(path)
+    let mut settings: Settings = std::fs::read_to_string(path)
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    // Upgrade older settings without changing their effective screenshot behavior.
+    // The old "normal" mode captured every display; privacy/active_window captured
+    // only the foreground window.
+    if settings.screenshot_capture_scope.trim().is_empty() {
+        settings.screenshot_capture_scope = match settings.screenshot_mode.as_str() {
+            "normal" | "full_screen" => "all_displays".into(),
+            _ => "active_window".into(),
+        };
+    }
+    settings
 }
 
 /// Load settings and guarantee a stable `device_id`. On first run (or an upgrade
@@ -204,11 +260,22 @@ pub fn apply(s: &Settings, control: &crate::trackers::TrackerControl) {
         .screenshot_retention_days
         .store(s.screenshot_retention_days, Relaxed);
     control.domain_only.store(s.domain_only, Relaxed);
-    control.screenshot_mode.store(
-        crate::trackers::shot_mode_from_str(&s.screenshot_mode),
-        Relaxed,
-    );
+    control.collect_app_activity.store(s.collect_app_activity, Relaxed);
+    control.collect_window_titles.store(s.collect_window_titles, Relaxed);
+    control.collect_browser_activity.store(s.collect_browser_activity, Relaxed);
+    let scope = if s.screenshot_capture_scope.trim().is_empty() {
+        match s.screenshot_mode.as_str() {
+            "normal" | "full_screen" => "all_displays",
+            _ => "active_window",
+        }
+    } else {
+        s.screenshot_capture_scope.as_str()
+    };
+    control
+        .screenshot_mode
+        .store(crate::trackers::shot_mode_from_str(scope), Relaxed);
     *control.screenshot_skip_apps.write().unwrap() = s.screenshot_skip_apps.clone();
+    *control.screenshot_privacy_rules.write().unwrap() = s.screenshot_privacy_rules.clone();
 
     // Capture opt-outs. On Windows nothing captures until the user has consented
     // (there are no per-feature OS prompts); macOS relies on TCC and ignores consent.
@@ -219,6 +286,82 @@ pub fn apply(s: &Settings, control: &crate::trackers::TrackerControl) {
     control
         .count_keystrokes
         .store(s.count_keystrokes && consent_ok, Relaxed);
+}
+
+/// Apply one server policy snapshot atomically to persisted settings + live trackers.
+/// Managed policy is authoritative; employee-local capture switches are ignored.
+pub fn apply_managed_policy(
+    state: &SettingsState,
+    control: &crate::trackers::TrackerControl,
+    policy: &crate::sync::client::Policy,
+    monitoring_enabled: bool,
+) -> CaptureManaged {
+    use std::sync::atomic::Ordering::Relaxed;
+
+    let status = CaptureManaged {
+        managed: policy.managed,
+        allow_employee_override: false,
+        family: policy.kind.as_deref() == Some("family"),
+        monitoring_enabled,
+    };
+
+    control.managed.store(policy.managed, Relaxed);
+    control
+        .org_monitoring_enabled
+        .store(monitoring_enabled, Relaxed);
+    *state.managed.lock().unwrap() = status;
+
+    if policy.managed {
+        let mut settings = state.current.lock().unwrap().clone();
+        settings.local_only = false;
+        settings.org_monitoring_enabled = monitoring_enabled;
+        settings.collect_app_activity = policy.collect_app_activity;
+        settings.collect_window_titles = policy.collect_window_titles;
+        settings.collect_browser_activity = policy.collect_browser_activity;
+        settings.capture_screenshots = policy.collect_screenshots;
+        settings.count_keystrokes = policy.collect_keystroke_counts;
+
+        if let Some(value) = policy.screenshot_interval_s {
+            settings.screenshot_interval_s = value;
+        }
+        if let Some(value) = policy.idle_threshold_s {
+            settings.idle_threshold_s = value;
+        }
+        // null server retention means indefinite. Local pruning must not become
+        // more aggressive as a side effect, so keep the last finite local value.
+        if let Some(value) = policy.screenshot_retention_days {
+            settings.screenshot_retention_days = value;
+        }
+        if let Some(scope) = policy.screenshot_capture_scope.clone() {
+            settings.screenshot_capture_scope = scope.clone();
+            settings.screenshot_mode = if scope == "active_window" {
+                "privacy".into()
+            } else {
+                "normal".into()
+            };
+        } else if let Some(mode) = policy.screenshot_mode.clone() {
+            settings.screenshot_mode = mode.clone();
+            settings.screenshot_capture_scope = match mode.as_str() {
+                "active_display" => "active_display".into(),
+                "normal" | "full_screen" | "all_displays" => "all_displays".into(),
+                _ => "active_window".into(),
+            };
+        }
+        if let Some(skip) = policy.screenshot_skip_apps.clone() {
+            settings.screenshot_skip_apps = skip;
+        }
+        settings.screenshot_privacy_rules = policy.privacy_rules.clone();
+
+        apply(&settings, control);
+        let _ = save(&state.path, &settings);
+        *state.current.lock().unwrap() = settings;
+    } else {
+        // Leaving managed mode restores the persisted local settings behavior.
+        let settings = state.current.lock().unwrap().clone();
+        apply(&settings, control);
+    }
+
+    status
 }
 
 /// Whether the org controls capture settings for the signed-in employee. Default
@@ -248,9 +391,9 @@ impl Default for CaptureManaged {
 }
 
 impl CaptureManaged {
-    /// Capture settings are locked (org-managed and override not allowed).
+    /// Organization-managed collection policy is never locally overridable.
     pub fn locked(&self) -> bool {
-        self.managed && !self.allow_employee_override
+        self.managed
     }
 }
 
@@ -271,6 +414,106 @@ mod tests {
         let s = load(Path::new("/nonexistent/actilens/settings.json"));
         assert_eq!(s.idle_threshold_s, DEFAULT_IDLE_THRESHOLD_S);
         assert!(!s.domain_only);
+    }
+
+    #[test]
+    fn managed_policy_overrides_local_capture_switches() {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let dir = std::env::temp_dir().join(format!(
+            "actilens_managed_policy_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+
+        let mut local = Settings::default();
+        local.consented = true;
+        local.collect_app_activity = true;
+        local.collect_window_titles = true;
+        local.collect_browser_activity = true;
+        local.capture_screenshots = true;
+        local.count_keystrokes = true;
+        local.screenshot_capture_scope = "all_displays".into();
+
+        let state = SettingsState {
+            path: path.clone(),
+            current: Mutex::new(local),
+            managed: Mutex::new(CaptureManaged::default()),
+        };
+        let control = crate::trackers::TrackerControl::new();
+        let policy: crate::sync::client::Policy = serde_json::from_value(
+            serde_json::json!({
+                "managed": true,
+                "business_id": "business-a",
+                "collect_app_activity": false,
+                "collect_window_titles": false,
+                "collect_screenshots": false,
+                "collect_browser_activity": false,
+                "collect_keystroke_counts": false,
+                "screenshot_interval_s": 120,
+                "idle_threshold_s": 90,
+                "screenshot_retention_days": 14,
+                "kind": "team",
+                "screenshot_capture_scope": "active_window",
+                "privacy_rules": []
+            }),
+        )
+        .unwrap();
+
+        let status = apply_managed_policy(&state, &control, &policy, true);
+        assert!(status.managed);
+        assert!(status.locked());
+        assert!(status.monitoring_enabled);
+
+        let persisted = state.current.lock().unwrap().clone();
+        assert!(!persisted.collect_app_activity);
+        assert!(!persisted.collect_window_titles);
+        assert!(!persisted.collect_browser_activity);
+        assert!(!persisted.capture_screenshots);
+        assert!(!persisted.count_keystrokes);
+        assert_eq!(persisted.screenshot_interval_s, 120);
+        assert_eq!(persisted.idle_threshold_s, 90);
+        assert_eq!(persisted.screenshot_retention_days, 14);
+        assert_eq!(persisted.screenshot_capture_scope, "active_window");
+
+        assert!(control.managed.load(Relaxed));
+        assert!(control.org_monitoring_enabled.load(Relaxed));
+        assert!(!control.collect_app_activity.load(Relaxed));
+        assert!(!control.collect_window_titles.load(Relaxed));
+        assert!(!control.collect_browser_activity.load(Relaxed));
+        assert!(!control.capture_screenshots.load(Relaxed));
+        assert!(!control.count_keystrokes.load(Relaxed));
+        assert_eq!(
+            control.screenshot_mode.load(Relaxed),
+            crate::trackers::SHOT_SCOPE_ACTIVE_WINDOW
+        );
+
+        let reloaded = load(&path);
+        assert!(!reloaded.collect_app_activity);
+        assert!(!reloaded.collect_window_titles);
+        assert!(!reloaded.collect_browser_activity);
+        assert!(!reloaded.capture_screenshots);
+        assert!(!reloaded.count_keystrokes);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn managed_scope_suppression_only_crosses_privacy_boundaries() {
+        let mut s = Settings::default();
+        assert!(!s.needs_managed_scope_suppression("business-a"));
+
+        s.local_only = true;
+        assert!(s.needs_managed_scope_suppression("business-a"));
+
+        s.local_only = false;
+        s.last_managed_business_id = Some("business-a".into());
+        assert!(!s.needs_managed_scope_suppression("business-a"));
+        assert!(s.needs_managed_scope_suppression("business-b"));
+
+        s.collection_scope_dirty = true;
+        assert!(s.needs_managed_scope_suppression("business-a"));
     }
 
     #[test]

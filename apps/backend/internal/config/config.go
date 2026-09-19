@@ -24,7 +24,8 @@ type Config struct {
 	LogMaxSizeMB   int    // rotate the log file once it exceeds this size
 	LogMaxBackups  int    // number of rotated files to keep
 	LogMaxAgeDays  int    // delete rotated files older than this many days
-	KeepaliveToken string // secret for the CPU keep-alive endpoint; "" = disabled
+	KeepaliveToken            string // secret for the CPU keep-alive endpoint; "" = disabled
+	RecommendedDesktopVersion string // recommended desktop semver; "" = version health unknown
 }
 
 // Load reads .env (if present) then the process environment. It returns an error
@@ -50,7 +51,8 @@ func Load() (*Config, error) {
 		LogMaxSizeMB:   getenvInt("LOG_MAX_SIZE_MB", 50),
 		LogMaxBackups:  getenvInt("LOG_MAX_BACKUPS", 5),
 		LogMaxAgeDays:  getenvInt("LOG_MAX_AGE_DAYS", 30),
-		KeepaliveToken: os.Getenv("KEEPALIVE_TOKEN"),
+		KeepaliveToken:            os.Getenv("KEEPALIVE_TOKEN"),
+		RecommendedDesktopVersion: strings.TrimSpace(os.Getenv("RECOMMENDED_DESKTOP_VERSION")),
 	}
 
 	var missing []string

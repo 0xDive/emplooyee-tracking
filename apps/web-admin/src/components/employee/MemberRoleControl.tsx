@@ -2,7 +2,7 @@ import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { updateMemberRole } from "../../api/endpoints";
 import type { BusinessRole, Employee } from "../../api/types";
-import { Badge, cx } from "../ds";
+import { Badge, SelectMenu } from "../ds";
 import { useToast } from "../ToastProvider";
 
 const EDITABLE_ROLES: Exclude<BusinessRole, "owner">[] = ["employee", "manager", "admin"];
@@ -21,6 +21,10 @@ export function MemberRoleControl({
   const { t } = useTranslation("dashboard");
   const { pushToast } = useToast();
   const [busy, setBusy] = useState(false);
+  if (employee.role === "owner") {
+    return <Badge tone="brand">{t("employees.roles.owner")}</Badge>;
+  }
+
   const role: Exclude<BusinessRole, "owner"> =
     employee.role === "admin" || employee.role === "manager" ? employee.role : "employee";
 
@@ -30,13 +34,17 @@ export function MemberRoleControl({
   }
 
   return (
-    <select
-      className={cx("ds-select", "employees-role-select")}
-      aria-label={t("employees.roleAria", { name: employee.display_name })}
+    <SelectMenu
+      id={`member-role-${employee.id}`}
+      className="employees-role-select"
+      ariaLabel={t("employees.roleAria", { name: employee.display_name })}
       value={role}
       disabled={busy}
-      onChange={async (event) => {
-        const next = event.target.value as Exclude<BusinessRole, "owner">;
+      options={EDITABLE_ROLES.map((item) => ({
+        value: item,
+        label: t(`employees.roles.${item}`),
+      }))}
+      onChange={async (next) => {
         if (next === role) return;
         setBusy(true);
         try {
@@ -51,12 +59,6 @@ export function MemberRoleControl({
           setBusy(false);
         }
       }}
-    >
-      {EDITABLE_ROLES.map((item) => (
-        <option key={item} value={item}>
-          {t(`employees.roles.${item}`)}
-        </option>
-      ))}
-    </select>
+    />
   );
 }

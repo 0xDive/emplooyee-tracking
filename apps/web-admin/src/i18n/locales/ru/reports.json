@@ -51,6 +51,10 @@
     "v1": {
       "subtitle": "Снимки за выбранный период",
       "emptyDescription": "Скриншоты появятся здесь, когда захват включён и агент синхронизирует данные."
-    }
+    },
+    "captureGroup_one": "Снимок {{time}} · {{count}} экран",
+    "captureGroup_few": "Снимок {{time}} · {{count}} экрана",
+    "captureGroup_many": "Снимок {{time}} · {{count}} экранов",
+    "captureGroup_other": "Снимок {{time}} · {{count}} экрана"
   }
 }

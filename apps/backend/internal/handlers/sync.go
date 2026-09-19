@@ -92,10 +92,8 @@ func (h *SyncHandler) Batch(c *gin.Context) {
 			badRequest(c, fmt.Sprintf("activity[%d]: %v", i, err))
 			return
 		}
-		if a.AppName == "" {
-			badRequest(c, fmt.Sprintf("activity[%d]: app_name required", i))
-			return
-		}
+		// app_name may be empty when managed policy keeps mandatory active/idle
+		// duration but disables application identity collection.
 		act = append(act, store.ActivityRow{
 			ClientUUID: a.ClientUUID, Ts: a.Ts, AppName: a.AppName, WindowTitle: a.WindowTitle,
 			Pid: a.Pid, DurationS: a.DurationS, ClientUpdatedAt: a.UpdatedAt,
@@ -131,10 +129,10 @@ func (h *SyncHandler) Batch(c *gin.Context) {
 	businessID, err := h.store.ResolveBusinessForUser(c.Request.Context(), userID, req.BusinessID)
 	switch {
 	case errors.Is(err, store.ErrNotFound):
-		c.JSON(http.StatusForbidden, gin.H{"error": "user belongs to no business"})
+		forbidden(c, "user belongs to no organization")
 		return
 	case errors.Is(err, store.ErrForbidden):
-		c.JSON(http.StatusForbidden, gin.H{"error": "not a member of that business"})
+		forbidden(c, "not a member of that organization")
 		return
 	case errors.Is(err, store.ErrAmbiguousBusiness):
 		badRequest(c, "multiple businesses: specify business_id")
@@ -145,12 +143,28 @@ func (h *SyncHandler) Batch(c *gin.Context) {
 	}
 
 	monitoringEnabled, err := h.store.MembershipMonitoringEnabled(c.Request.Context(), userID, businessID)
-	if err != nil {
+	switch {
+	case errors.Is(err, store.ErrMemberBlocked):
+		apiError(c, http.StatusForbidden, ErrCodeMemberBlocked, "organization access is suspended", nil)
+		return
+	case errors.Is(err, store.ErrMemberRemoved):
+		apiError(c, http.StatusForbidden, ErrCodeMemberRemoved, "organization membership was removed", nil)
+		return
+	case errors.Is(err, store.ErrOrganizationArchived):
+		apiError(c, http.StatusConflict, ErrCodeOrganizationArchived, "organization is archived", nil)
+		return
+	case errors.Is(err, store.ErrOrganizationDeletionPending):
+		apiError(c, http.StatusConflict, ErrCodeOrganizationDeletionPending, "organization deletion is pending", nil)
+		return
+	case errors.Is(err, store.ErrNotFound), errors.Is(err, store.ErrMembershipUnavailable):
+		forbidden(c, "membership is unavailable")
+		return
+	case err != nil:
 		serverError(c, err)
 		return
 	}
 	if !monitoringEnabled {
-		c.JSON(http.StatusForbidden, gin.H{"error": "monitoring is disabled for this membership"})
+		forbidden(c, "monitoring is disabled for this membership")
 		return
 	}
 
@@ -163,12 +177,22 @@ func (h *SyncHandler) Batch(c *gin.Context) {
 	}
 	if err := h.store.SyncBatch(c.Request.Context(), userID, businessID, req.DeviceID, meta, act, keys, brs); err != nil {
 		switch {
+		case errors.Is(err, store.ErrMemberBlocked):
+			apiError(c, http.StatusForbidden, ErrCodeMemberBlocked, "organization access is suspended", nil)
+		case errors.Is(err, store.ErrMemberRemoved):
+			apiError(c, http.StatusForbidden, ErrCodeMemberRemoved, "organization membership was removed", nil)
+		case errors.Is(err, store.ErrOrganizationArchived):
+			apiError(c, http.StatusConflict, ErrCodeOrganizationArchived, "organization is archived", nil)
+		case errors.Is(err, store.ErrOrganizationDeletionPending):
+			apiError(c, http.StatusConflict, ErrCodeOrganizationDeletionPending, "organization deletion is pending", nil)
 		case errors.Is(err, store.ErrMembershipUnavailable):
-			c.JSON(http.StatusForbidden, gin.H{"error": "membership is unavailable or monitoring is disabled"})
+			apiError(c, http.StatusForbidden, ErrCodePermissionDenied, "monitoring is disabled for this membership", nil)
 		case errors.Is(err, store.ErrDeviceRevoked):
-			c.JSON(http.StatusForbidden, gin.H{"error": "this device was revoked by the administrator"})
+			apiError(c, http.StatusForbidden, ErrCodeDeviceRevoked, "this device was revoked by the administrator", nil)
+		case errors.Is(err, store.ErrDeviceLimitReached):
+			apiError(c, http.StatusConflict, ErrCodeDeviceLimitReached, "device limit reached", nil)
 		case errors.Is(err, store.ErrForbidden):
-			c.JSON(http.StatusForbidden, gin.H{"error": "device id belongs to another account"})
+			forbidden(c, "device id belongs to another account or organization")
 		default:
 			serverError(c, err)
 		}

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"actilens/backend/internal/auth"
@@ -13,40 +14,58 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// ReportsHandler serves the owner read path (roster, per-employee data, images).
 type ReportsHandler struct {
 	store *store.Store
 	files *filestore.Store
 }
 
-// NewReportsHandler wires the reports handler.
 func NewReportsHandler(s *store.Store, files *filestore.Store) *ReportsHandler {
 	return &ReportsHandler{store: s, files: files}
 }
 
-// Roster returns the employee roster for a business the caller owns.
-// Query: business_id (required).
+// Roster returns the current organization roster. "Today" follows the
+// organization timezone instead of the server timezone.
 func (h *ReportsHandler) Roster(c *gin.Context) {
-	ownerID, _ := auth.UserID(c)
-	businessID := c.Query("business_id")
+	viewerID, _ := auth.UserID(c)
+	businessID := strings.TrimSpace(c.Query("business_id"))
 	if businessID == "" {
 		badRequest(c, "business_id is required")
 		return
 	}
-	allowed, err := h.store.HasBusinessPermission(c.Request.Context(), ownerID, businessID, store.PermissionReports)
-	if err != nil {
-		serverError(c, err)
+
+	role, err := h.store.MembershipRole(c.Request.Context(), viewerID, businessID)
+	if err != nil || !storeRoleCanViewReports(role) {
+		forbidden(c, "insufficient permission")
 		return
 	}
-	if !allowed {
-		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permission"})
+	business, err := h.store.GetBusiness(c.Request.Context(), businessID)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			notFound(c, "organization not found")
+		} else {
+			serverError(c, err)
+		}
+		return
+	}
+	if (business.ArchivedAt != nil || business.DeletionScheduledAt != nil) &&
+		role != store.RoleOwner && role != store.RoleAdmin {
+		forbidden(c, "archived organization reports require owner or admin access")
 		return
 	}
 
-	// "Today" is the current UTC day; the window is [midnight, +24h).
-	now := time.Now().UTC()
-	dayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC).Unix()
-	roster, err := h.store.Roster(c.Request.Context(), businessID, dayStart, dayStart+86400)
+	location, err := time.LoadLocation(business.Timezone)
+	if err != nil {
+		location = time.UTC
+	}
+	now := time.Now().In(location)
+	localMidnight := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, location)
+	ydayStart := localMidnight.AddDate(0, 0, -1).Unix()
+	dayStart := localMidnight.Unix()
+	dayEnd := localMidnight.AddDate(0, 0, 1).Unix()
+
+	roster, err := h.store.Roster(
+		c.Request.Context(), businessID, ydayStart, dayStart, dayEnd,
+	)
 	if err != nil {
 		serverError(c, err)
 		return
@@ -54,27 +73,34 @@ func (h *ReportsHandler) Roster(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"employees": roster})
 }
 
-// Activity returns the timeline + app breakdown for an employee.
+func storeRoleCanViewReports(role store.BusinessRole) bool {
+	return role == store.RoleOwner || role == store.RoleAdmin || role == store.RoleManager
+}
+
 func (h *ReportsHandler) Activity(c *gin.Context) {
-	ownerID, empID, from, to, ok := h.scope(c)
+	viewerID, businessID, empID, from, to, ok := h.scope(c)
 	if !ok {
 		return
 	}
-	samples, breakdown, err := h.store.ActivityReport(c.Request.Context(), empID, ownerID, from, to)
+	samples, breakdown, err := h.store.ActivityReportInBusiness(
+		c.Request.Context(), empID, businessID, from, to,
+	)
 	if err != nil {
 		serverError(c, err)
 		return
 	}
+	_ = viewerID
 	c.JSON(http.StatusOK, gin.H{"samples": samples, "breakdown": breakdown})
 }
 
-// Keystrokes returns count buckets for an employee.
 func (h *ReportsHandler) Keystrokes(c *gin.Context) {
-	ownerID, empID, from, to, ok := h.scope(c)
+	_, businessID, empID, from, to, ok := h.scope(c)
 	if !ok {
 		return
 	}
-	buckets, err := h.store.KeystrokesReport(c.Request.Context(), empID, ownerID, from, to)
+	buckets, err := h.store.KeystrokesReportInBusiness(
+		c.Request.Context(), empID, businessID, from, to,
+	)
 	if err != nil {
 		serverError(c, err)
 		return
@@ -82,13 +108,14 @@ func (h *ReportsHandler) Keystrokes(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"buckets": buckets})
 }
 
-// Browser returns page visits for an employee.
 func (h *ReportsHandler) Browser(c *gin.Context) {
-	ownerID, empID, from, to, ok := h.scope(c)
+	_, businessID, empID, from, to, ok := h.scope(c)
 	if !ok {
 		return
 	}
-	visits, err := h.store.BrowserReport(c.Request.Context(), empID, ownerID, from, to)
+	visits, err := h.store.BrowserReportInBusiness(
+		c.Request.Context(), empID, businessID, from, to,
+	)
 	if err != nil {
 		serverError(c, err)
 		return
@@ -96,15 +123,16 @@ func (h *ReportsHandler) Browser(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"visits": visits})
 }
 
-// Screenshots returns paginated screenshot metadata for an employee.
 func (h *ReportsHandler) Screenshots(c *gin.Context) {
-	ownerID, empID, from, to, ok := h.scope(c)
+	_, businessID, empID, from, to, ok := h.scope(c)
 	if !ok {
 		return
 	}
 	limit := clampInt(c.Query("limit"), 50, 1, 200)
 	offset := clampInt(c.Query("offset"), 0, 0, 1<<31)
-	shots, err := h.store.ScreenshotsReport(c.Request.Context(), empID, ownerID, from, to, limit, offset)
+	shots, err := h.store.ScreenshotsReportInBusiness(
+		c.Request.Context(), empID, businessID, from, to, limit, offset,
+	)
 	if err != nil {
 		serverError(c, err)
 		return
@@ -112,80 +140,98 @@ func (h *ReportsHandler) Screenshots(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"screenshots": shots, "limit": limit, "offset": offset})
 }
 
-// ScreenshotImage streams a stored screenshot if the caller owns the business it
-// belongs to.
 func (h *ReportsHandler) ScreenshotImage(c *gin.Context) {
-	ownerID, _ := auth.UserID(c)
-	clientUUID := c.Param("client_uuid")
+	viewerID, _ := auth.UserID(c)
+	businessID := strings.TrimSpace(c.Query("business_id"))
+	if businessID == "" {
+		badRequest(c, "business_id is required")
+		return
+	}
 
-	relPath, err := h.store.ScreenshotPathForOwner(c.Request.Context(), ownerID, clientUUID)
+	relPath, err := h.store.ScreenshotPathInBusiness(
+		c.Request.Context(), viewerID, businessID, c.Param("client_uuid"),
+	)
 	if errors.Is(err, store.ErrNotFound) {
-		c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
+		notFound(c, "not found")
 		return
 	}
 	if err != nil {
 		serverError(c, err)
 		return
 	}
-	f, err := h.files.Open(relPath)
+
+	file, err := h.files.Open(relPath)
 	if err != nil {
-		// Metadata exists but the file is gone (e.g. cleaned up) — treat as missing.
-		c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
+		notFound(c, "not found")
 		return
 	}
-	defer f.Close()
-	fi, err := f.Stat()
+	defer file.Close()
+
+	info, err := file.Stat()
 	if err != nil {
 		serverError(c, err)
 		return
 	}
-	c.DataFromReader(http.StatusOK, fi.Size(), "image/webp", f, nil)
+	c.DataFromReader(http.StatusOK, info.Size(), "image/webp", file, nil)
 }
 
-// scope authenticates, validates the :id employee is one the caller owns, and parses
-// the from/to window. It writes the error response and returns ok=false on failure.
-func (h *ReportsHandler) scope(c *gin.Context) (ownerID, empID string, from, to int64, ok bool) {
-	ownerID, _ = auth.UserID(c)
+// scope validates an explicit business/member pair and the report window.
+// Former-member history is available only to Owner/Admin.
+func (h *ReportsHandler) scope(
+	c *gin.Context,
+) (viewerID, businessID, empID string, from, to int64, ok bool) {
+	viewerID, _ = auth.UserID(c)
+	businessID = strings.TrimSpace(c.Query("business_id"))
 	empID = c.Param("id")
-
-	owns, err := h.store.CanViewEmployeeReports(c.Request.Context(), ownerID, empID)
-	if err != nil {
-		serverError(c, err)
+	if businessID == "" {
+		badRequest(c, "business_id is required")
 		return
 	}
-	if !owns {
-		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permission"})
+
+	if _, err := h.store.ReportAccessInBusiness(
+		c.Request.Context(), viewerID, empID, businessID,
+	); err != nil {
+		if errors.Is(err, store.ErrForbidden) || errors.Is(err, store.ErrNotFound) {
+			forbidden(c, "insufficient permission")
+		} else {
+			serverError(c, err)
+		}
 		return
 	}
 
 	from = parseInt64(c.Query("from"), 0)
 	to = parseInt64(c.Query("to"), time.Now().Unix()+1)
-	return ownerID, empID, from, to, true
+	if to <= from {
+		badRequest(c, "to must be greater than from")
+		return
+	}
+	ok = true
+	return
 }
 
-func parseInt64(s string, def int64) int64 {
-	if s == "" {
+func parseInt64(value string, def int64) int64 {
+	if value == "" {
 		return def
 	}
-	v, err := strconv.ParseInt(s, 10, 64)
+	parsed, err := strconv.ParseInt(value, 10, 64)
 	if err != nil {
 		return def
 	}
-	return v
+	return parsed
 }
 
-func clampInt(s string, def, lo, hi int) int {
-	v := def
-	if s != "" {
-		if n, err := strconv.Atoi(s); err == nil {
-			v = n
+func clampInt(value string, def, lo, hi int) int {
+	n := def
+	if value != "" {
+		if parsed, err := strconv.Atoi(value); err == nil {
+			n = parsed
 		}
 	}
-	if v < lo {
+	if n < lo {
 		return lo
 	}
-	if v > hi {
+	if n > hi {
 		return hi
 	}
-	return v
+	return n
 }

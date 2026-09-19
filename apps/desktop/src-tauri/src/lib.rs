@@ -115,6 +115,7 @@ pub fn run() {
             commands::list_businesses,
             commands::signup_url,
             commands::login,
+            commands::complete_mfa_login,
             commands::logout,
             commands::current_session,
             commands::sync_status,

@@ -1,6 +1,11 @@
 package store
 
-import "context"
+import (
+	"context"
+	"errors"
+)
+
+var ErrCollectionDisabled = errors.New("collection disabled")
 
 // ScreenshotFile identifies a stored screenshot for cleanup.
 type ScreenshotFile struct {
@@ -14,6 +19,30 @@ func (s *Store) ScreenshotsBefore(ctx context.Context, businessID string, cutoff
 	rows, err := s.pool.Query(ctx,
 		`SELECT id, file_path, byte_size FROM screenshots
 		  WHERE business_id = $1 AND ts < $2`, businessID, cutoffTs)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := []ScreenshotFile{}
+	for rows.Next() {
+		var f ScreenshotFile
+		if err := rows.Scan(&f.ID, &f.FilePath, &f.ByteSize); err != nil {
+			return nil, err
+		}
+		out = append(out, f)
+	}
+	return out, rows.Err()
+}
+
+// ScreenshotsRange lists a business's screenshots in the half-open [from,to)
+// Unix-second range used by organization-local calendar cleanup.
+func (s *Store) ScreenshotsRange(ctx context.Context, businessID string, fromTs, toTs int64) ([]ScreenshotFile, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT id, file_path, byte_size FROM screenshots
+		  WHERE business_id = $1 AND ts >= $2 AND ts < $3`,
+		businessID, fromTs, toTs,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -79,16 +108,18 @@ type ScreenshotRow struct {
 	Width           *int
 	Height          *int
 	DisplayID       *int
+	CaptureGroupID  *string
 	ClientUpdatedAt int64
 }
 
 const screenshotUpsert = `
 INSERT INTO screenshots
-  (client_uuid, user_id, business_id, device_id, ts, file_path, byte_size, width, height, display_id, client_updated_at)
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+  (client_uuid, user_id, business_id, device_id, ts, file_path, byte_size, width, height, display_id, capture_group_id, client_updated_at)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
 ON CONFLICT (client_uuid) DO UPDATE SET
   ts = EXCLUDED.ts, file_path = EXCLUDED.file_path, byte_size = EXCLUDED.byte_size,
   width = EXCLUDED.width, height = EXCLUDED.height, display_id = EXCLUDED.display_id,
+  capture_group_id = EXCLUDED.capture_group_id,
   client_updated_at = EXCLUDED.client_updated_at, received_at = now()`
 
 // UpsertScreenshot idempotently records screenshot metadata keyed by client_uuid.
@@ -102,9 +133,19 @@ func (s *Store) UpsertScreenshot(ctx context.Context, userID, businessID string,
 	if err := ensureMembershipCollectableTx(ctx, tx, userID, businessID); err != nil {
 		return err
 	}
+	var collectScreenshots bool
+	if err := tx.QueryRow(ctx,
+		`SELECT collect_screenshots FROM businesses WHERE id = $1 FOR SHARE`,
+		businessID,
+	).Scan(&collectScreenshots); err != nil {
+		return err
+	}
+	if !collectScreenshots {
+		return ErrCollectionDisabled
+	}
 	if _, err := tx.Exec(ctx, screenshotUpsert,
 		r.ClientUUID, userID, businessID, r.DeviceID, r.Ts,
-		r.FilePath, r.ByteSize, r.Width, r.Height, r.DisplayID, r.ClientUpdatedAt); err != nil {
+		r.FilePath, r.ByteSize, r.Width, r.Height, r.DisplayID, r.CaptureGroupID, r.ClientUpdatedAt); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)

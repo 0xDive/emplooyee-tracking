@@ -17,7 +17,7 @@ export interface MemberTerms {
 /** Resolve localized member terminology from a business kind. Defaults to team
  *  wording when the kind is missing (e.g. before the business has loaded). */
 export function memberTerms(kind: BusinessKind | undefined | null): MemberTerms {
-  const group = kind === "family" ? "family" : "team";
+  const group = kind === "family" ? "family" : kind === "other" ? "other" : "team";
   const term = (k: string) => i18n.t(`terms.${group}.${k}`, { ns: "common" });
   return {
     one: term("one"),
@@ -25,7 +25,7 @@ export function memberTerms(kind: BusinessKind | undefined | null): MemberTerms 
     lowerOne: term("lowerOne"),
     lowerMany: term("lowerMany"),
     addCta: term("addCta"),
-    idAbbrev: group === "family" ? "kid" : "emp",
+    idAbbrev: group === "family" ? "kid" : group === "other" ? "mem" : "emp",
     org: term("org"),
   };
 }

@@ -4,7 +4,7 @@
     "loadingBusinesses": "Loading businesses…",
     "loadingRoster": "Loading roster…",
     "errorRoster": "Could not load the roster.",
-    "noBusinesses": "No businesses yet. Go to <0>{{members}}</0> to add your first {{member}} — a business is created automatically.",
+    "noBusinesses": "No organization yet. Go to Employees to create an organization first, then add members.",
     "noActivity": "No {{members}} have synced activity yet.",
     "selfBadge": "You",
     "view": "View",
@@ -40,7 +40,8 @@
       "status": {
         "active": "Active",
         "idle": "Idle",
-        "offline": "Offline"
+        "offline": "Offline",
+        "blocked": "Blocked"
       },
       "appsTitle": "Current applications",
       "appsSubtitle": "Applications used by active or idle members now",
@@ -49,7 +50,10 @@
       "peopleCount_other": "{{count}} people",
       "recentTitle": "Recently seen",
       "recentSubtitle": "Members ordered by latest activity",
-      "screenshots": "Screenshots"
+      "screenshots": "Screenshots",
+      "deviceHealthWarning_one": "{{count}} device needs an ActiLens update (recommended: {{version}}).",
+      "deviceHealthWarning_other": "{{count}} devices need an ActiLens update (recommended: {{version}}).",
+      "recommendedRelease": "current recommended release"
     }
   },
   "employees": {
@@ -58,10 +62,10 @@
     "loading": "Loading…",
     "loadingMembers": "Loading {{members}}…",
     "errorLoadMembers": "Could not load {{members}}.",
-    "noBusinessNotice": "You don't own a business yet. Adding your first {{member}} will automatically create one (<1>\"&lt;your name&gt;'s Team\"</1>). You can also create one explicitly with \"New business\".",
+    "noBusinessNotice": "Create or select an organization before adding a member.",
     "rosterFor": "Roster for <0>{{name}}</0>",
     "noMembersYet": "No {{members}} in this business yet.",
-    "autoCreatedNote": "No business existed, so a default one was created automatically and your {{member}} was added to it.",
+    "autoCreatedNote": "Organization created and member added.",
     "viewReports": "View reports",
     "table": {
       "name": "Name",
@@ -80,7 +84,8 @@
       "enrollment": "Install code",
       "purge": "Delete permanently",
       "more": "More actions",
-      "openProfile": "Open profile"
+      "openProfile": "Open profile",
+      "remove": "Remove from organization"
     },
     "prompts": {
       "displayName": "New display name",
@@ -96,7 +101,8 @@
     "roles": {
       "employee": "Employee",
       "manager": "Manager",
-      "admin": "Admin"
+      "admin": "Admin",
+      "owner": "Owner"
     },
     "monitoring": {
       "on": "On",
@@ -146,6 +152,28 @@
       "offline": "Offline",
       "blocked": "Blocked",
       "never": "Never"
+    },
+    "lifecycle": {
+      "viewLabel": "Member list",
+      "activeMembers": "Active members",
+      "formerMembers": "Former members",
+      "removed": "Removed",
+      "removedAt": "Removed",
+      "noFormer": "No former members",
+      "noFormerDescription": "Members removed from this organization will appear here while their retained history remains available.",
+      "errorLoadFormer": "Could not load former members.",
+      "removeTitle": "Remove {{name}} from this organization?",
+      "removeWarning": "This removes organization access and stops future monitoring, but it does not delete retained history.",
+      "removeScope": "The member will move to Former members. Owner/Admin can still view retained history, restore the member later, or permanently purge organization-scoped data.",
+      "removedToast": "Member moved to Former members.",
+      "restore": "Restore member",
+      "restoreTitle": "Restore {{name}}?",
+      "restoreInfo": "The same account and retained history will be restored. The member returns with the Employee role.",
+      "restoreMonitoring": "Enable monitoring after restore",
+      "restoreMonitoringHelp": "If disabled, the member is restored but managed monitoring remains off until an administrator enables it.",
+      "restoredToast": "Member restored.",
+      "viewHistory": "View retained history",
+      "readOnly": "This organization is archived and read-only. Historical reports, members, former members and devices remain available until it is restored or deleted."
     }
   },
   "newBusinessModal": {
@@ -160,7 +188,7 @@
     "errorCreate": "Could not create business."
   },
   "newEmployeeModal": {
-    "noBusinessSelected": "No business selected — a default one will be created automatically for this {{member}}.",
+    "noBusinessSelected": "Select or create an organization before adding this {{member}}.",
     "displayName": "Display name",
     "usernameOrEmail": "Username or email",
     "temporaryPassword": "Temporary password",
@@ -221,7 +249,17 @@
       "saved": "Device updated.",
       "v1": {
         "emptyDescription": "The device will appear here after the ActiLens agent syncs for the first time."
-      }
+      },
+      "versionStatus": {
+        "current": "Current",
+        "outdated": "Outdated",
+        "unknown": "Unknown version"
+      },
+      "outdatedWarning_one": "{{count}} active device is running an outdated ActiLens agent. Update it to the recommended release.",
+      "outdatedWarning_other": "{{count}} active devices are running an outdated ActiLens agent. Update them to the recommended release.",
+      "deviceLimitReached": "This device cannot be restored because the organization active-device limit is already reached. Revoke another device or increase the organization limit.",
+      "reenroll": "Enroll / re-enroll device",
+      "reenrollHint": "To use this computer again as a new installation, generate a fresh enrollment code."
     },
     "errorIdentity": "Could not load this employee.",
     "v1": {

@@ -51,9 +51,13 @@ func (h *OwnerHandler) UpdateMemberRole(c *gin.Context) {
 	case err == nil:
 		c.JSON(http.StatusOK, gin.H{"status": "ok", "role": role})
 	case errors.Is(err, store.ErrNotFound):
-		c.JSON(http.StatusNotFound, gin.H{"error": "member not found"})
+		notFound(c, "member not found")
 	case errors.Is(err, store.ErrForbidden):
-		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permission"})
+		forbidden(c, "insufficient permission")
+	case errors.Is(err, store.ErrOrganizationArchived):
+		apiError(c, http.StatusConflict, ErrCodeOrganizationArchived, "organization is archived", nil)
+	case errors.Is(err, store.ErrOrganizationDeletionPending):
+		apiError(c, http.StatusConflict, ErrCodeOrganizationDeletionPending, "organization deletion is pending", nil)
 	case errors.Is(err, store.ErrConflict):
 		badRequest(c, "invalid role")
 	default:
@@ -82,9 +86,13 @@ func (h *OwnerHandler) UpdateMemberMonitoring(c *gin.Context) {
 	case err == nil:
 		c.JSON(http.StatusOK, gin.H{"status": "ok", "monitoring_enabled": *req.Enabled})
 	case errors.Is(err, store.ErrNotFound):
-		c.JSON(http.StatusNotFound, gin.H{"error": "member not found"})
+		notFound(c, "member not found")
 	case errors.Is(err, store.ErrForbidden):
-		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permission"})
+		forbidden(c, "insufficient permission")
+	case errors.Is(err, store.ErrOrganizationArchived):
+		apiError(c, http.StatusConflict, ErrCodeOrganizationArchived, "organization is archived", nil)
+	case errors.Is(err, store.ErrOrganizationDeletionPending):
+		apiError(c, http.StatusConflict, ErrCodeOrganizationDeletionPending, "organization deletion is pending", nil)
 	default:
 		serverError(c, err)
 	}

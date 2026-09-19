@@ -1,0 +1,142 @@
+.account-v1 {
+  width: 100%;
+}
+
+.account-v1__stack {
+  display: grid;
+  gap: 24px;
+}
+
+.account-v1__alert {
+  margin-bottom: 16px;
+}
+
+.account-v1__identity {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+  flex-wrap: wrap;
+  color: var(--ds-text-secondary);
+  font-size: var(--ds-text-sm);
+}
+
+.account-v1__sessions-head {
+  margin-bottom: 14px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  color: var(--ds-text-secondary);
+  font-size: var(--ds-text-sm);
+}
+
+.account-v1__session-list {
+  display: grid;
+  gap: 8px;
+}
+
+.account-v1__session {
+  min-height: 72px;
+  padding: 12px 13px;
+  border: 1px solid var(--ds-border-subtle);
+  border-radius: var(--ds-radius-md);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  background: var(--ds-bg-subtle);
+}
+
+.account-v1__session-copy {
+  min-width: 0;
+}
+
+.account-v1__session-title {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex-wrap: wrap;
+  color: var(--ds-text-primary);
+  font-size: var(--ds-text-sm);
+  font-weight: 700;
+}
+
+.account-v1__session-label {
+  margin-top: 3px;
+  max-width: 760px;
+  overflow: hidden;
+  color: var(--ds-text-secondary);
+  font-size: var(--ds-text-xs);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.account-v1__session-meta {
+  margin-top: 3px;
+  color: var(--ds-text-tertiary);
+  font-size: 11px;
+  line-height: 15px;
+}
+
+.account-v1__form {
+  display: grid;
+  gap: 16px;
+}
+
+.account-v1__secret {
+  padding: 12px;
+  border: 1px solid var(--ds-border-subtle);
+  border-radius: var(--ds-radius-md);
+  display: grid;
+  gap: 8px;
+  background: var(--ds-bg-subtle);
+}
+
+.account-v1__secret > span {
+  color: var(--ds-text-secondary);
+  font-size: var(--ds-text-xs);
+  font-weight: 650;
+}
+
+.account-v1__secret code {
+  overflow-wrap: anywhere;
+  color: var(--ds-text-primary);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 13px;
+  user-select: all;
+}
+
+.account-v1__recovery-codes {
+  margin: 14px 0;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.account-v1__recovery-codes code {
+  padding: 9px 10px;
+  border: 1px solid var(--ds-border-subtle);
+  border-radius: var(--ds-radius-md);
+  background: var(--ds-bg-subtle);
+  color: var(--ds-text-primary);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 13px;
+  text-align: center;
+  user-select: all;
+}
+
+@media (max-width: 760px) {
+  .account-v1__session {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .account-v1__identity {
+    justify-content: flex-start;
+  }
+
+  .account-v1__recovery-codes {
+    grid-template-columns: 1fr;
+  }
+}

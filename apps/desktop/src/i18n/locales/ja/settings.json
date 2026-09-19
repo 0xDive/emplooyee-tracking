@@ -71,5 +71,13 @@
   "screenshots": "スクリーンショット",
   "skipAppsCustom": "カスタム",
   "skipAppsAddAll": "すべて追加",
-  "skipAppsRemoveAll": "すべて削除"
+  "skipAppsRemoveAll": "すべて削除",
+  "screenshotScope": "スクリーンショット範囲",
+  "screenshotScopeDesc": "キャプチャする範囲を選択します。",
+  "scopeActiveWindow": "アクティブウィンドウ",
+  "scopeActiveWindowDesc": "最前面のアプリウィンドウだけをキャプチャします。",
+  "scopeActiveDisplay": "アクティブディスプレイ",
+  "scopeActiveDisplayDesc": "最前面のウィンドウがあるディスプレイをキャプチャします。",
+  "scopeAllDisplays": "すべてのディスプレイ",
+  "scopeAllDisplaysDesc": "接続中の各ディスプレイを同じキャプチャグループの別画像として保存します。"
 }

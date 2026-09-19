@@ -2,6 +2,7 @@ import { tokenStore } from "./tokenStore";
 import { ApiError, type Tokens } from "./types";
 import { Sentry } from "../sentry";
 import { log } from "../log";
+import i18n from "../i18n";
 
 // Empty default base => same-origin relative URLs, which the Vite dev proxy
 // (and the backend serving the built SPA in prod) forwards to /v1/*. Set
@@ -88,11 +89,41 @@ async function parseBody(res: Response): Promise<unknown> {
 function errorMessage(body: unknown, fallback: string): string {
   if (body && typeof body === "object") {
     const b = body as Record<string, unknown>;
+    if (typeof b.error === "object" && b.error) {
+      const nested = b.error as Record<string, unknown>;
+      if (typeof nested.message === "string") return nested.message;
+    }
     for (const key of ["error", "message", "detail"]) {
       if (typeof b[key] === "string") return b[key] as string;
     }
   }
   if (typeof body === "string" && body.trim()) return body;
+  return fallback;
+}
+
+function errorCode(body: unknown): string | null {
+  if (!body || typeof body !== "object") return null;
+  const b = body as Record<string, unknown>;
+  if (typeof b.code === "string") return b.code;
+  if (typeof b.error === "object" && b.error) {
+    const nested = b.error as Record<string, unknown>;
+    if (typeof nested.code === "string") return nested.code;
+  }
+  return null;
+}
+
+function errorDetails(body: unknown): unknown {
+  if (!body || typeof body !== "object") return null;
+  const b = body as Record<string, unknown>;
+  return b.details ?? null;
+}
+
+function localizedError(code: string | null, fallback: string): string {
+  if (!code) return fallback;
+  const key = `errors.${code}`;
+  if (i18n.exists(key, { ns: "common" })) {
+    return i18n.t(key, { ns: "common" });
+  }
   return fallback;
 }
 
@@ -132,12 +163,24 @@ export async function request<T>(path: string, opts: RequestOpts = {}): Promise<
       return request<T>(path, { ...opts, _retried: true });
     }
     emitLogout();
-    throw new ApiError(401, "Session expired. Please sign in again.", null);
+    throw new ApiError(
+      401,
+      localizedError("session_revoked", "Session expired. Please sign in again."),
+      null,
+      "session_revoked",
+    );
   }
 
   if (!res.ok) {
     const errBody = await parseBody(res);
-    const apiErr = new ApiError(res.status, errorMessage(errBody, `Request failed (${res.status})`), errBody);
+    const code = errorCode(errBody);
+    const apiErr = new ApiError(
+      res.status,
+      localizedError(code, errorMessage(errBody, `Request failed (${res.status})`)),
+      errBody,
+      code,
+      errorDetails(errBody),
+    );
     // Report server-side failures only; 4xx are expected/handled by the UI.
     if (res.status >= 500) {
       Sentry.captureException(apiErr, { tags: { method, path } });
@@ -149,18 +192,56 @@ export async function request<T>(path: string, opts: RequestOpts = {}): Promise<
   return (await parseBody(res)) as T;
 }
 
+export async function fetchAuthenticatedBlob(
+  path: string,
+  retried = false,
+): Promise<Blob> {
+  const tok = tokenStore.getAccess();
+  const res = await fetch(buildUrl(path), {
+    headers: tok ? { Authorization: `Bearer ${tok}` } : {},
+  });
+  if (res.status === 401 && !retried) {
+    const ok = await refreshOnce();
+    if (ok) return fetchAuthenticatedBlob(path, true);
+    emitLogout();
+    throw new ApiError(
+      401,
+      localizedError("session_revoked", "Session expired."),
+      null,
+      "session_revoked",
+    );
+  }
+  if (!res.ok) {
+    const body = await parseBody(res);
+    const code = errorCode(body);
+    throw new ApiError(
+      res.status,
+      localizedError(code, errorMessage(body, `Download failed (${res.status})`)),
+      body,
+      code,
+      errorDetails(body),
+    );
+  }
+  return res.blob();
+}
+
 // Auth-gated image fetch: pulls bytes with the Bearer header and returns an
 // object URL the caller can use as an <img src> (and must revoke later).
-export async function fetchImageObjectUrl(clientUuid: string): Promise<string> {
+export async function fetchImageObjectUrl(
+  clientUuid: string,
+  businessId: string,
+): Promise<string> {
   const tok = tokenStore.getAccess();
-  const res = await fetch(buildUrl(`/v1/screenshots/${clientUuid}`), {
+  const res = await fetch(
+    buildUrl(`/v1/screenshots/${clientUuid}`, { business_id: businessId }),
+    {
     headers: tok ? { Authorization: `Bearer ${tok}` } : {},
   });
   if (res.status === 401) {
     const ok = await refreshOnce();
-    if (ok) return fetchImageObjectUrl(clientUuid);
+    if (ok) return fetchImageObjectUrl(clientUuid, businessId);
     emitLogout();
-    throw new ApiError(401, "Session expired.", null);
+    throw new ApiError(401, "Session expired.", null, "session_revoked");
   }
   if (!res.ok) throw new ApiError(res.status, `Image failed (${res.status})`, null);
   const blob = await res.blob();

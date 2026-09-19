@@ -19,11 +19,30 @@ type updateEmployeeReq struct {
 }
 
 // UpdateEmployee lets the business owner edit login/name and archive/restore an employee.
+func legacyBusinessID(c *gin.Context) (string, bool) {
+	businessID := strings.TrimSpace(c.Query("business_id"))
+	if businessID == "" {
+		badRequest(c, "business_id is required")
+		return "", false
+	}
+	return businessID, true
+}
+
+// UpdateEmployee is retained for old clients but no longer performs global account
+// activation changes or infers an organization. New clients use the scoped member API.
 func (h *OwnerHandler) UpdateEmployee(c *gin.Context) {
-	ownerID, _ := auth.UserID(c)
+	actorID, _ := auth.UserID(c)
+	businessID, ok := legacyBusinessID(c)
+	if !ok {
+		return
+	}
 	var req updateEmployeeReq
 	if err := c.ShouldBindJSON(&req); err != nil {
 		badRequest(c, "invalid body")
+		return
+	}
+	if req.Active != nil {
+		badRequest(c, "active is no longer supported; use organization member lifecycle")
 		return
 	}
 	if req.Email != nil {
@@ -47,8 +66,15 @@ func (h *OwnerHandler) UpdateEmployee(c *gin.Context) {
 		req.DisplayName = &v
 	}
 
-	e, err := h.store.UpdateEmployee(c.Request.Context(), ownerID, c.Param("id"),
-		req.Email, req.Username, req.DisplayName, req.Active)
+	e, err := h.store.UpdateManagedMemberIdentity(
+		c.Request.Context(),
+		actorID,
+		businessID,
+		c.Param("id"),
+		req.Email,
+		req.Username,
+		req.DisplayName,
+	)
 	if employeeMutationError(c, err) {
 		return
 	}
@@ -60,7 +86,11 @@ type resetEmployeePasswordReq struct {
 }
 
 func (h *OwnerHandler) ResetEmployeePassword(c *gin.Context) {
-	ownerID, _ := auth.UserID(c)
+	actorID, _ := auth.UserID(c)
+	businessID, ok := legacyBusinessID(c)
+	if !ok {
+		return
+	}
 	var req resetEmployeePasswordReq
 	if err := c.ShouldBindJSON(&req); err != nil {
 		badRequest(c, "invalid body")
@@ -75,21 +105,28 @@ func (h *OwnerHandler) ResetEmployeePassword(c *gin.Context) {
 		serverError(c, err)
 		return
 	}
-	err = h.store.ResetEmployeePassword(c.Request.Context(), ownerID, c.Param("id"), hash)
+	err = h.store.ResetManagedMemberPassword(
+		c.Request.Context(), actorID, businessID, c.Param("id"), hash,
+	)
 	if employeeMutationError(c, err) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"status": "ok"})
 }
 
-// ArchiveEmployee is intentionally a soft delete: history/screenshots remain available.
+// ArchiveEmployee is a compatibility alias for organization-scoped member removal.
+// It never disables the global user account.
 func (h *OwnerHandler) ArchiveEmployee(c *gin.Context) {
-	ownerID, _ := auth.UserID(c)
-	err := h.store.SetEmployeeActive(c.Request.Context(), ownerID, c.Param("id"), false)
+	actorID, _ := auth.UserID(c)
+	businessID, ok := legacyBusinessID(c)
+	if !ok {
+		return
+	}
+	err := h.store.RemoveMember(c.Request.Context(), actorID, businessID, c.Param("id"))
 	if employeeMutationError(c, err) {
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"status": "archived"})
+	c.JSON(http.StatusOK, gin.H{"status": "removed"})
 }
 
 func employeeMutationError(c *gin.Context, err error) bool {
@@ -97,11 +134,15 @@ func employeeMutationError(c *gin.Context, err error) bool {
 	case err == nil:
 		return false
 	case errors.Is(err, store.ErrConflict):
-		c.JSON(http.StatusConflict, gin.H{"error": "email/username conflict or invalid employee data"})
+		conflict(c, ErrCodeIdentifierTaken, "email/username conflict or invalid member data")
 	case errors.Is(err, store.ErrNotFound):
-		c.JSON(http.StatusNotFound, gin.H{"error": "employee not found"})
+		notFound(c, "member not found")
 	case errors.Is(err, store.ErrForbidden):
-		c.JSON(http.StatusForbidden, gin.H{"error": "not your employee"})
+		forbidden(c, "insufficient permission")
+	case errors.Is(err, store.ErrOrganizationArchived):
+		apiError(c, http.StatusConflict, ErrCodeOrganizationArchived, "organization is archived", nil)
+	case errors.Is(err, store.ErrOrganizationDeletionPending):
+		apiError(c, http.StatusConflict, ErrCodeOrganizationDeletionPending, "organization deletion is pending", nil)
 	default:
 		serverError(c, err)
 	}

@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1120 320" role="img" aria-label="ActiLens">
+  <defs>
+    <linearGradient id="main" x1="0.18" y1="0.06" x2="0.78" y2="0.94"><stop offset="0" stop-color="#39C6FF"/><stop offset="0.43" stop-color="#1769FF"/><stop offset="0.76" stop-color="#3C32EE"/><stop offset="1" stop-color="#7B2CF2"/></linearGradient>
+    <linearGradient id="fold" x1="0.22" y1="0.08" x2="0.92" y2="0.92"><stop offset="0" stop-color="#2418B7"/><stop offset="0.46" stop-color="#4930E7"/><stop offset="1" stop-color="#B45CFF"/></linearGradient>
+    <linearGradient id="base" x1="0" y1="0.16" x2="1" y2="0.8"><stop offset="0" stop-color="#2149E9"/><stop offset="0.52" stop-color="#334BFA"/><stop offset="1" stop-color="#A84DFF"/></linearGradient>
+    <radialGradient id="lens" cx="62%" cy="32%" r="78%"><stop offset="0" stop-color="#86C9FF"/><stop offset="0.42" stop-color="#556BF7"/><stop offset="1" stop-color="#3036E9"/></radialGradient>
+  </defs>
+  <g transform="translate(0 -10) scale(.64)">
+    <path fill="url(#main)" d="M70 425c-12 0-19-13-13-23L222 111c15-27 29-43 51-43 22 0 38 16 52 42l58 103c-25-6-51-3-74 9-14 7-27 18-38 31l-30 38-73 121c-7 10-20 13-31 13H70z"/>
+    <path fill="url(#fold)" d="M286 189c28-23 68-27 101-10 33 17 55 51 56 89 1 49-18 94-57 142l-46-72c22-31 32-59 30-82-2-24-13-40-31-48-17-8-35-5-53 7l-26-13c8-5 17-10 26-13z"/>
+    <path fill="url(#base)" d="M300 425c-12 0-20-13-14-23l67-111 48 76h51c8 0 15 4 19 11l15 26c6 10-2 21-14 21H300z"/>
+    <circle cx="274" cy="305" r="40" fill="url(#lens)"/>
+  </g>
+  <text x="360" y="202" fill="#0B1D51" font-family="Manrope, Inter, Arial, sans-serif" font-size="110" font-weight="650" letter-spacing="12">ACTILENS</text>
+</svg>

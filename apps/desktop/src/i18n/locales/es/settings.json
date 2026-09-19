@@ -71,5 +71,13 @@
   "screenshots": "Capturas de pantalla",
   "skipAppsCustom": "Personalizadas",
   "skipAppsAddAll": "Añadir todo",
-  "skipAppsRemoveAll": "Quitar todo"
+  "skipAppsRemoveAll": "Quitar todo",
+  "screenshotScope": "Ámbito de captura",
+  "screenshotScopeDesc": "Elige exactamente qué se captura.",
+  "scopeActiveWindow": "Ventana activa",
+  "scopeActiveWindowDesc": "Captura solo la ventana de la aplicación en primer plano.",
+  "scopeActiveDisplay": "Pantalla activa",
+  "scopeActiveDisplayDesc": "Captura la pantalla que contiene la ventana activa.",
+  "scopeAllDisplays": "Todas las pantallas",
+  "scopeAllDisplaysDesc": "Captura cada pantalla conectada como una imagen separada del mismo grupo."
 }

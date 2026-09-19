@@ -31,9 +31,20 @@ const MAX_CHUNK_S: i64 = 60;
 /// Live, shareable control surface for the trackers. The UI flips these (pause,
 /// idle threshold) and the loop reads them each tick.
 pub struct TrackerControl {
+    /// User-controlled pause. Ignored while organization policy is managed.
     pub paused: AtomicBool,
-    /// Server-controlled collection switch. Independent from the user's Pause.
+    /// Setup/onboarding safety gate. This is independent from the user pause so a
+    /// managed installation can stay stopped until setup completes without giving
+    /// the employee a way to pause organization monitoring afterwards.
+    pub in_setup: AtomicBool,
+    /// Managed installations cannot locally pause or weaken organization policy.
+    pub managed: AtomicBool,
+    /// Server-controlled collection switch.
     pub org_monitoring_enabled: AtomicBool,
+    /// Active/idle is mandatory in managed mode; these govern identifying details.
+    pub collect_app_activity: AtomicBool,
+    pub collect_window_titles: AtomicBool,
+    pub collect_browser_activity: AtomicBool,
     pub idle_threshold_s: AtomicU64,
     pub screenshot_interval_s: AtomicU64,
     pub screenshot_retention_days: AtomicU64,
@@ -47,6 +58,8 @@ pub struct TrackerControl {
     /// (case-insensitive whole-word match on the active window's app name).
     /// Prefilled with the curated sensitive-app rules by default; user-editable.
     pub screenshot_skip_apps: RwLock<Vec<String>>,
+    /// Structured managed privacy rules evaluated before any screenshot bytes are created.
+    pub screenshot_privacy_rules: RwLock<Vec<crate::sync::client::PrivacyRule>>,
     /// Count keystrokes (user opt-out; Windows: also gated on consent).
     pub count_keystrokes: AtomicBool,
 }
@@ -55,7 +68,12 @@ impl TrackerControl {
     pub fn new() -> Self {
         TrackerControl {
             paused: AtomicBool::new(false),
+            in_setup: AtomicBool::new(true),
+            managed: AtomicBool::new(false),
             org_monitoring_enabled: AtomicBool::new(true),
+            collect_app_activity: AtomicBool::new(true),
+            collect_window_titles: AtomicBool::new(true),
+            collect_browser_activity: AtomicBool::new(true),
             idle_threshold_s: AtomicU64::new(DEFAULT_IDLE_THRESHOLD_S),
             screenshot_interval_s: AtomicU64::new(DEFAULT_SCREENSHOT_INTERVAL_S),
             screenshot_retention_days: AtomicU64::new(DEFAULT_RETENTION_DAYS),
@@ -63,28 +81,42 @@ impl TrackerControl {
             capture_screenshots: AtomicBool::new(true),
             screenshot_mode: AtomicU8::new(SHOT_MODE_PRIVACY),
             screenshot_skip_apps: RwLock::new(default_privacy_apps_flat()),
+            screenshot_privacy_rules: RwLock::new(Vec::new()),
             count_keystrokes: AtomicBool::new(true),
         }
     }
 
+    pub fn effective_paused(&self) -> bool {
+        if self.in_setup.load(Ordering::Relaxed)
+            || !self.org_monitoring_enabled.load(Ordering::Relaxed)
+        {
+            return true;
+        }
+        !self.managed.load(Ordering::Relaxed) && self.paused.load(Ordering::Relaxed)
+    }
+
     pub fn collection_allowed(&self) -> bool {
-        self.org_monitoring_enabled.load(Ordering::Relaxed) && !self.paused.load(Ordering::Relaxed)
+        !self.effective_paused()
     }
 }
 
-/// Screenshot capture modes (see `Settings::screenshot_mode`): privacy captures
-/// only the active window; normal captures every display.
-pub const SHOT_MODE_PRIVACY: u8 = 0;
-pub const SHOT_MODE_NORMAL: u8 = 1;
+/// Screenshot capture scopes. The old privacy/normal names remain accepted for
+/// local settings compatibility, but managed policy uses the explicit three-way scope.
+pub const SHOT_SCOPE_ACTIVE_WINDOW: u8 = 0;
+pub const SHOT_SCOPE_ACTIVE_DISPLAY: u8 = 1;
+pub const SHOT_SCOPE_ALL_DISPLAYS: u8 = 2;
 
-/// Map the persisted mode string to its atomic value. "full_screen" is the
-/// pre-rename value of "normal"; anything else (including the pre-rename
-/// "active_window" and unknown/future strings) falls back to privacy — the
-/// default, and the mode that captures the least.
+/// Legacy aliases kept for older call sites/tests while the UI migrates.
+pub const SHOT_MODE_PRIVACY: u8 = SHOT_SCOPE_ACTIVE_WINDOW;
+pub const SHOT_MODE_NORMAL: u8 = SHOT_SCOPE_ALL_DISPLAYS;
+
+/// Map persisted/new scope strings to the live atomic value. Unknown values fail
+/// closed to active-window, the least expansive capture scope.
 pub fn shot_mode_from_str(s: &str) -> u8 {
     match s {
-        "normal" | "full_screen" => SHOT_MODE_NORMAL,
-        _ => SHOT_MODE_PRIVACY,
+        "active_display" => SHOT_SCOPE_ACTIVE_DISPLAY,
+        "all_displays" | "normal" | "full_screen" => SHOT_SCOPE_ALL_DISPLAYS,
+        _ => SHOT_SCOPE_ACTIVE_WINDOW,
     }
 }
 
@@ -433,6 +465,52 @@ fn contains_word(name: &str, pat: &str) -> bool {
     false
 }
 
+/// Match a structured organization privacy rule against the foreground window.
+/// Matching is case-insensitive and happens before any capture call.
+fn privacy_rule_matches(rule: &crate::sync::client::PrivacyRule, active: &ActiveWindowInfo) -> bool {
+    if !rule.enabled {
+        return false;
+    }
+    let pattern = rule.pattern.trim().to_lowercase();
+    if pattern.is_empty() {
+        return false;
+    }
+    let kind = rule.kind.trim().to_lowercase();
+    let match_type = rule.match_type.trim().to_lowercase();
+    match kind.as_str() {
+        "app" => {
+            let value = active.app_name.to_lowercase();
+            match match_type.as_str() {
+                "exact" => value == pattern,
+                "contains" => value.contains(&pattern),
+                _ => false,
+            }
+        }
+        "window_title" if match_type == "contains" => active
+            .title
+            .as_deref()
+            .map(|title| title.to_lowercase().contains(&pattern))
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
+/// Resolve the xcap window that best represents the foreground window.
+fn find_active_capture_window(active: &ActiveWindowInfo) -> Option<xcap::Window> {
+    let windows = xcap::Window::all().ok()?;
+    let title = active.title.as_deref().unwrap_or("");
+    windows
+        .into_iter()
+        .filter(|w| {
+            w.pid().map(|p| p as i64 == active.pid).unwrap_or(false)
+                && !w.is_minimized().unwrap_or(true)
+        })
+        .max_by_key(|w| {
+            let title_match = !title.is_empty() && w.title().map(|t| t == title).unwrap_or(false);
+            (title_match, w.z().unwrap_or(i32::MIN))
+        })
+}
+
 /// Active-window mode: capture only the frontmost window. Candidates are the
 /// app's (pid-matched) non-minimized windows; among them prefer the one whose
 /// title equals the active window's title, then the topmost by z-order — an app
@@ -445,18 +523,7 @@ fn capture_active_window(
     active: &ActiveWindowInfo,
     now: i64,
 ) -> Option<usize> {
-    let windows = xcap::Window::all().ok()?;
-    let title = active.title.as_deref().unwrap_or("");
-    let win = windows
-        .into_iter()
-        .filter(|w| {
-            w.pid().map(|p| p as i64 == active.pid).unwrap_or(false)
-                && !w.is_minimized().unwrap_or(true)
-        })
-        .max_by_key(|w| {
-            let title_match = !title.is_empty() && w.title().map(|t| t == title).unwrap_or(false);
-            (title_match, w.z().unwrap_or(i32::MIN))
-        })?;
+    let win = find_active_capture_window(active)?;
     let img = win.capture_image().ok()?;
     let (bytes, w, h) = compress_to_webp(&img);
     let path = dir.join(format!("{now}_window.webp"));
@@ -478,7 +545,39 @@ fn capture_active_window(
     Some(1)
 }
 
-/// Take one capture tick: skip entirely when the frontmost app is on the
+/// Active-display mode: capture exactly the monitor containing the foreground
+/// window. A lookup miss drops the tick rather than widening the scope.
+fn capture_active_display(
+    db: &Db,
+    dir: &Path,
+    active: &ActiveWindowInfo,
+    now: i64,
+) -> Option<usize> {
+    let win = find_active_capture_window(active)?;
+    let monitor = win.current_monitor().ok()?;
+    let img = monitor.capture_image().ok()?;
+    let (bytes, w, h) = compress_to_webp(&img);
+    let path = dir.join(format!("{now}_active_display.webp"));
+    if let Err(e) = std::fs::write(&path, &bytes) {
+        crate::log_warn!("screenshot", "save failed: {e}");
+        return None;
+    }
+    let shot = Screenshot {
+        ts: now,
+        file_path: path.to_string_lossy().into_owned(),
+        display_id: None,
+        width: Some(w as i64),
+        height: Some(h as i64),
+    };
+    if let Err(e) = db.insert_screenshot(&shot) {
+        crate::log_warn!("screenshot", "db insert failed: {e}");
+        return None;
+    }
+    Some(1)
+}
+
+/// Take one capture tick: evaluate privacy exclusions first, then capture exactly
+/// the configured scope. Scope misses never fall back to a broader capture.
 /// skip-list; otherwise capture per the configured mode (active-window shots
 /// fall back to full screen on a miss), compress to ≤50 KB WebP under `dir`,
 /// and record each shot in the DB. Returns how many shots were saved.
@@ -487,83 +586,111 @@ pub fn capture_once(db: &Db, dir: &Path, control: &TrackerControl) -> usize {
     if !control.collection_allowed() {
         return 0;
     }
+
+    let scope = control.screenshot_mode.load(Ordering::Relaxed);
+    let active = crate::platform::active_window();
+
+    // Privacy rules are scope-independent and must be checked before a screenshot
+    // is created. Keep the legacy exact-app list active as a compatibility layer.
+    if let Some(ref win) = active {
+        let matched_rule = {
+            let rules = control.screenshot_privacy_rules.read().unwrap();
+            rules.iter().any(|rule| privacy_rule_matches(rule, win))
+        };
+        let matched_legacy = {
+            let skip = control.screenshot_skip_apps.read().unwrap();
+            should_skip(&win.app_name, &skip)
+        };
+        if matched_rule || matched_legacy {
+            crate::log_info!(
+                "screenshot",
+                "skipped tick: privacy rule matched {}",
+                win.app_name
+            );
+            return 0;
+        }
+    }
+
     if let Err(e) = std::fs::create_dir_all(dir) {
         crate::log_warn!("screenshot", "create dir failed: {e}");
         return 0;
     }
 
-    let mode = control.screenshot_mode.load(Ordering::Relaxed);
-    let active = crate::platform::active_window();
-    // The skip-list is a privacy-mode feature (normal mode captures everything).
-    if mode == SHOT_MODE_PRIVACY {
-        if let Some(ref win) = active {
-            let skip = control.screenshot_skip_apps.read().unwrap();
-            if should_skip(&win.app_name, &skip) {
-                crate::log_info!(
-                    "screenshot",
-                    "skipped tick: {} is on the skip-list",
-                    win.app_name
-                );
-                return 0;
-            }
-        }
-    }
-
     let now = now_ts();
-    if mode == SHOT_MODE_PRIVACY {
-        if let Some(saved) = active
-            .as_ref()
-            .and_then(|win| capture_active_window(db, dir, win, now))
-        {
-            return saved;
-        }
-        // Frontmost window not capturable (desktop focus, transient surface,
-        // window gone) — never silently drop the tick: full-screen fallback.
-        crate::log_info!(
-            "screenshot",
-            "active-window capture missed; falling back to full screen"
-        );
-    }
-
-    let monitors = match xcap::Monitor::all() {
-        Ok(m) => m,
-        Err(e) => {
-            crate::log_warn!("screenshot", "enumerate monitors failed: {e}");
-            return 0;
-        }
-    };
-
-    let mut saved = 0;
-    for (i, monitor) in monitors.into_iter().enumerate() {
-        let img = match monitor.capture_image() {
-            Ok(img) => img,
-            Err(e) => {
-                crate::log_warn!("screenshot", "capture failed: {e}");
-                continue;
+    match scope {
+        SHOT_SCOPE_ACTIVE_WINDOW => {
+            let Some(ref win) = active else {
+                crate::log_info!("screenshot", "active-window capture skipped: no foreground window");
+                return 0;
+            };
+            match capture_active_window(db, dir, win, now) {
+                Some(saved) => saved,
+                None => {
+                    crate::log_info!(
+                        "screenshot",
+                        "active-window capture missed; tick dropped without broader fallback"
+                    );
+                    0
+                }
             }
-        };
-        // Compress to a small WebP; store the *encoded* dimensions so width/height
-        // match the bytes on disk (and what the backend records).
-        let (bytes, w, h) = compress_to_webp(&img);
-        let path = dir.join(format!("{now}_display{i}.webp"));
-        if let Err(e) = std::fs::write(&path, &bytes) {
-            crate::log_warn!("screenshot", "save failed: {e}");
-            continue;
         }
-        let shot = Screenshot {
-            ts: now,
-            file_path: path.to_string_lossy().into_owned(),
-            display_id: Some(i as i64),
-            width: Some(w as i64),
-            height: Some(h as i64),
-        };
-        if let Err(e) = db.insert_screenshot(&shot) {
-            crate::log_warn!("screenshot", "db insert failed: {e}");
-            continue;
+        SHOT_SCOPE_ACTIVE_DISPLAY => {
+            let Some(ref win) = active else {
+                crate::log_info!("screenshot", "active-display capture skipped: no foreground window");
+                return 0;
+            };
+            match capture_active_display(db, dir, win, now) {
+                Some(saved) => saved,
+                None => {
+                    crate::log_info!(
+                        "screenshot",
+                        "active-display capture missed; tick dropped without broader fallback"
+                    );
+                    0
+                }
+            }
         }
-        saved += 1;
+        _ => {
+            let monitors = match xcap::Monitor::all() {
+                Ok(m) => m,
+                Err(e) => {
+                    crate::log_warn!("screenshot", "enumerate monitors failed: {e}");
+                    return 0;
+                }
+            };
+
+            let capture_group_id = uuid::Uuid::new_v4().to_string();
+            let mut saved = 0;
+            for (i, monitor) in monitors.into_iter().enumerate() {
+                let img = match monitor.capture_image() {
+                    Ok(img) => img,
+                    Err(e) => {
+                        crate::log_warn!("screenshot", "capture failed: {e}");
+                        continue;
+                    }
+                };
+                let (bytes, w, h) = compress_to_webp(&img);
+                let path = dir.join(format!("{now}_display{i}.webp"));
+                if let Err(e) = std::fs::write(&path, &bytes) {
+                    crate::log_warn!("screenshot", "save failed: {e}");
+                    continue;
+                }
+                let shot = Screenshot {
+                    ts: now,
+                    file_path: path.to_string_lossy().into_owned(),
+                    display_id: Some(i as i64),
+                    width: Some(w as i64),
+                    height: Some(h as i64),
+                };
+                if let Err(e) = db.insert_screenshot_with_group(&shot, Some(&capture_group_id)) {
+                    crate::log_warn!("screenshot", "db insert failed: {e}");
+                    continue;
+                }
+                saved += 1;
+            }
+            saved
+        }
     }
-    saved
 }
 
 /// Spawn the screenshot retention job (task 29): periodically delete screenshots
@@ -619,8 +746,25 @@ fn run(db: Arc<Db>, control: Arc<TrackerControl>) {
         let idle = crate::platform::idle_seconds();
         let active = control.collection_allowed() && idle < threshold as f64;
 
+        let collect_apps = control.collect_app_activity.load(Ordering::Relaxed);
+        let collect_titles = control.collect_window_titles.load(Ordering::Relaxed);
         let win = if active {
-            crate::platform::active_window()
+            if collect_apps {
+                crate::platform::active_window().map(|mut window| {
+                    if !collect_titles {
+                        window.title = None;
+                    }
+                    window
+                })
+            } else {
+                // Preserve mandatory active/idle duration without collecting the
+                // foreground application or window identity.
+                Some(ActiveWindowInfo {
+                    app_name: String::new(),
+                    title: None,
+                    pid: 0,
+                })
+            }
         } else {
             None
         };
@@ -697,6 +841,53 @@ mod tests {
         let (bytes, w, h) = compress_to_webp(&img);
         assert!(bytes.len() <= SCREENSHOT_MAX_BYTES);
         assert_eq!((w, h), (800, 600));
+    }
+
+    #[test]
+    fn screenshot_scope_parser_is_backward_compatible() {
+        assert_eq!(shot_mode_from_str("active_window"), SHOT_SCOPE_ACTIVE_WINDOW);
+        assert_eq!(shot_mode_from_str("privacy"), SHOT_SCOPE_ACTIVE_WINDOW);
+        assert_eq!(shot_mode_from_str("active_display"), SHOT_SCOPE_ACTIVE_DISPLAY);
+        assert_eq!(shot_mode_from_str("all_displays"), SHOT_SCOPE_ALL_DISPLAYS);
+        assert_eq!(shot_mode_from_str("normal"), SHOT_SCOPE_ALL_DISPLAYS);
+        assert_eq!(shot_mode_from_str("unknown"), SHOT_SCOPE_ACTIVE_WINDOW);
+    }
+
+    #[test]
+    fn structured_privacy_rules_match_before_capture() {
+        let active = ActiveWindowInfo {
+            app_name: "Google Chrome".into(),
+            title: Some("Payroll — Q3 review".into()),
+            pid: 42,
+        };
+        let app_exact = crate::sync::client::PrivacyRule {
+            id: "1".into(),
+            kind: "app".into(),
+            match_type: "exact".into(),
+            pattern: "google chrome".into(),
+            enabled: true,
+        };
+        let app_contains = crate::sync::client::PrivacyRule {
+            id: "2".into(),
+            kind: "app".into(),
+            match_type: "contains".into(),
+            pattern: "chrome".into(),
+            enabled: true,
+        };
+        let title_contains = crate::sync::client::PrivacyRule {
+            id: "3".into(),
+            kind: "window_title".into(),
+            match_type: "contains".into(),
+            pattern: "PAYROLL".into(),
+            enabled: true,
+        };
+        assert!(privacy_rule_matches(&app_exact, &active));
+        assert!(privacy_rule_matches(&app_contains, &active));
+        assert!(privacy_rule_matches(&title_contains, &active));
+
+        let mut disabled = title_contains.clone();
+        disabled.enabled = false;
+        assert!(!privacy_rule_matches(&disabled, &active));
     }
 
     #[test]

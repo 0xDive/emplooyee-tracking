@@ -2,11 +2,16 @@ import {
   forwardRef,
   useEffect,
   useId,
+  useLayoutEffect,
+  useRef,
+  useState,
   type ButtonHTMLAttributes,
+  type CSSProperties,
   type InputHTMLAttributes,
   type ReactNode,
   type SelectHTMLAttributes,
 } from "react";
+import { createPortal } from "react-dom";
 
 export function cx(...values: Array<string | false | null | undefined>): string {
   return values.filter(Boolean).join(" ");
@@ -222,6 +227,237 @@ export const SelectField = forwardRef<HTMLSelectElement, SelectFieldProps>(
   },
 );
 
+export type SelectMenuOption<T extends string = string> = {
+  value: T;
+  label: string;
+};
+
+export function SelectMenu<T extends string>({
+  id,
+  label,
+  description,
+  value,
+  options,
+  onChange,
+  disabled = false,
+  className,
+  ariaLabel,
+  searchable = false,
+  searchPlaceholder = "Search…",
+  emptyText = "No matches",
+  menuWidth,
+}: {
+  id: string;
+  label?: string;
+  description?: string;
+  value: T;
+  options: Array<SelectMenuOption<T>>;
+  onChange: (value: T) => void;
+  disabled?: boolean;
+  className?: string;
+  ariaLabel?: string;
+  searchable?: boolean;
+  searchPlaceholder?: string;
+  emptyText?: string;
+  menuWidth?: number;
+}) {
+  const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState("");
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
+  const searchRef = useRef<HTMLInputElement>(null);
+  const [menuStyle, setMenuStyle] = useState<CSSProperties>({
+    position: "fixed",
+    top: 0,
+    left: 0,
+    width: 220,
+    maxHeight: 420,
+    visibility: "hidden",
+  });
+  const selected = options.find((option) => option.value === value) ?? options[0];
+  const normalizedQuery = query.trim().toLocaleLowerCase();
+  const visibleOptions =
+    searchable && normalizedQuery
+      ? options.filter((option) =>
+          option.label.toLocaleLowerCase().includes(normalizedQuery),
+        )
+      : options;
+
+  useLayoutEffect(() => {
+    if (!open) return;
+
+    const gap = 6;
+    const margin = 12;
+
+    function positionMenu() {
+      const trigger = triggerRef.current;
+      if (!trigger) return;
+
+      const rect = trigger.getBoundingClientRect();
+      const width = Math.min(
+        Math.max(menuWidth ?? rect.width, rect.width, 200),
+        Math.max(200, window.innerWidth - margin * 2),
+      );
+      const measuredHeight = menuRef.current?.scrollHeight ?? 320;
+      const spaceBelow = Math.max(120, window.innerHeight - rect.bottom - gap - margin);
+      const spaceAbove = Math.max(120, rect.top - gap - margin);
+      const openAbove = spaceBelow < Math.min(measuredHeight, 300) && spaceAbove > spaceBelow;
+      const available = openAbove ? spaceAbove : spaceBelow;
+      const maxHeight = Math.min(460, available);
+      const left = Math.min(
+        Math.max(margin, rect.left),
+        Math.max(margin, window.innerWidth - width - margin),
+      );
+      const top = openAbove
+        ? Math.max(margin, rect.top - gap - Math.min(measuredHeight, maxHeight))
+        : rect.bottom + gap;
+
+      setMenuStyle({
+        position: "fixed",
+        top,
+        left,
+        width,
+        maxHeight,
+        zIndex: 1400,
+        visibility: "visible",
+      });
+    }
+
+    function onPointerDown(event: MouseEvent) {
+      const target = event.target as Node;
+      if (triggerRef.current?.contains(target) || menuRef.current?.contains(target)) return;
+      setOpen(false);
+    }
+
+    function onKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape") setOpen(false);
+    }
+
+    const frame = requestAnimationFrame(() => {
+      positionMenu();
+      if (searchable) searchRef.current?.focus();
+    });
+    window.addEventListener("resize", positionMenu);
+    document.addEventListener("scroll", positionMenu, true);
+    document.addEventListener("mousedown", onPointerDown);
+    document.addEventListener("keydown", onKeyDown);
+
+    return () => {
+      cancelAnimationFrame(frame);
+      window.removeEventListener("resize", positionMenu);
+      document.removeEventListener("scroll", positionMenu, true);
+      document.removeEventListener("mousedown", onPointerDown);
+      document.removeEventListener("keydown", onKeyDown);
+    };
+  }, [menuWidth, open, searchable]);
+
+  function toggleOpen() {
+    setOpen((current) => {
+      if (!current) setQuery("");
+      return !current;
+    });
+  }
+
+  const control = (
+    <div className={cx("ds-popover-select", className)}>
+      <button
+        ref={triggerRef}
+        id={id}
+        type="button"
+        className="ds-popover-select__trigger"
+        aria-haspopup="listbox"
+        aria-expanded={open}
+        aria-label={ariaLabel}
+        disabled={disabled}
+        onClick={toggleOpen}
+        onKeyDown={(event) => {
+          if (event.key === "ArrowDown" || event.key === "Enter" || event.key === " ") {
+            event.preventDefault();
+            if (!open) setQuery("");
+            setOpen(true);
+          }
+        }}
+      >
+        <span className="ds-popover-select__value">{selected?.label ?? ""}</span>
+        <svg
+          className="ds-popover-select__chevron"
+          viewBox="0 0 20 20"
+          width="16"
+          height="16"
+          aria-hidden
+        >
+          <path
+            d="m6 8 4 4 4-4"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="1.8"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          />
+        </svg>
+      </button>
+
+      {open && createPortal(
+        <div
+          ref={menuRef}
+          className="ds-popover-select__menu"
+          role="listbox"
+          aria-labelledby={id}
+          style={menuStyle}
+        >
+          {searchable && (
+            <div className="ds-popover-select__search-wrap">
+              <input
+                ref={searchRef}
+                type="search"
+                className="ds-input ds-popover-select__search"
+                value={query}
+                placeholder={searchPlaceholder}
+                aria-label={searchPlaceholder}
+                onChange={(event) => setQuery(event.currentTarget.value)}
+              />
+            </div>
+          )}
+          <div className="ds-popover-select__options">
+            {visibleOptions.length === 0 ? (
+              <div className="ds-popover-select__empty">{emptyText}</div>
+            ) : (
+              visibleOptions.map((option) => {
+                const active = option.value === value;
+                return (
+                  <button
+                    key={option.value}
+                    type="button"
+                    role="option"
+                    aria-selected={active}
+                    className={cx("ds-popover-select__option", active && "is-active")}
+                    onClick={() => {
+                      onChange(option.value);
+                      setOpen(false);
+                    }}
+                  >
+                    <span>{option.label}</span>
+                    {active && <span className="ds-popover-select__check">✓</span>}
+                  </button>
+                );
+              })
+            )}
+          </div>
+        </div>,
+        document.body,
+      )}
+    </div>
+  );
+
+  if (!label) return control;
+
+  return (
+    <FieldFrame htmlFor={id} label={label} description={description}>
+      {control}
+    </FieldFrame>
+  );
+}
+
 export function Switch({
   checked,
   onCheckedChange,
@@ -345,7 +581,7 @@ export function Dialog({
   onClose: () => void;
   children: ReactNode;
   footer?: ReactNode;
-  size?: "confirm" | "default" | "complex";
+  size?: "confirm" | "default" | "complex" | "wide" | "workspace";
   closeOnBackdrop?: boolean;
 }) {
   const titleId = useId();
@@ -358,7 +594,7 @@ export function Dialog({
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [onClose]);
 
-  return (
+  return createPortal(
     <div
       className="ds-modal-backdrop"
       onMouseDown={(event) => {
@@ -370,6 +606,8 @@ export function Dialog({
           "ds-modal",
           size === "confirm" && "ds-modal--confirm",
           size === "complex" && "ds-modal--complex",
+          size === "wide" && "ds-modal--wide",
+          size === "workspace" && "ds-modal--workspace",
         )}
         role="dialog"
         aria-modal="true"
@@ -383,6 +621,7 @@ export function Dialog({
         <div className="ds-modal__body">{children}</div>
         {footer && <div className="ds-modal__footer">{footer}</div>}
       </div>
-    </div>
+    </div>,
+    document.body,
   );
 }

@@ -10,6 +10,7 @@ import { Employees } from "./pages/Employees";
 import { SignIn } from "./auth/SignIn";
 import { SignupWizard } from "./auth/SignupWizard";
 import { Settings } from "./pages/Settings";
+import { Account } from "./pages/Account";
 
 export default function App() {
   return (
@@ -31,6 +32,7 @@ export default function App() {
                 <Route path="employees" element={<Employees />} />
                 <Route path="employees/:id" element={<EmployeeDetail />} />
                 <Route path="settings" element={<Settings />} />
+                <Route path="account" element={<Account />} />
               </Route>
             </Route>
             <Route path="*" element={<Navigate to="/" replace />} />

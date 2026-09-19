@@ -1,22 +1,14 @@
 import type { ReactNode } from "react";
 import { useTranslation } from "react-i18next";
 import { LOCALES } from "../i18n";
+import { SelectMenu } from "../components/ds";
 import { useTheme, type ThemeMode } from "../theme/ThemeProvider";
 import "../theme/auth-v1.css";
 
 function BrandMark() {
   return (
     <span className="auth-v1__brand-mark" aria-hidden>
-      <svg
-        viewBox="0 0 24 24"
-        fill="none"
-        stroke="currentColor"
-        strokeWidth="2"
-        strokeLinecap="round"
-        strokeLinejoin="round"
-      >
-        <path d="M3 12h4l2-5 4 10 2-5h6" />
-      </svg>
+      <img src="/brand/mark.svg" alt="" />
     </span>
   );
 }
@@ -36,29 +28,30 @@ export function AuthLayout({
   return (
     <div className="auth-v1">
       <div className="auth-v1__top">
-        <select
+        <SelectMenu
+          id="auth-language"
           className="auth-v1__control"
-          aria-label={t("language")}
+          ariaLabel={t("language")}
           value={locale}
-          onChange={(event) => i18n.changeLanguage(event.currentTarget.value)}
-        >
-          {LOCALES.map((item) => (
-            <option key={item.code} value={item.code}>
-              {item.label}
-            </option>
-          ))}
-        </select>
+          options={LOCALES.map((item) => ({
+            value: item.code,
+            label: item.label,
+          }))}
+          onChange={(value) => void i18n.changeLanguage(value)}
+        />
 
-        <select
+        <SelectMenu<ThemeMode>
+          id="auth-theme"
           className="auth-v1__control"
-          aria-label={t("theme.auto")}
+          ariaLabel={t("theme.auto")}
           value={mode}
-          onChange={(event) => setMode(event.currentTarget.value as ThemeMode)}
-        >
-          <option value="light">{t("theme.light")}</option>
-          <option value="dark">{t("theme.dark")}</option>
-          <option value="system">{t("theme.auto")}</option>
-        </select>
+          options={[
+            { value: "light", label: t("theme.light") },
+            { value: "dark", label: t("theme.dark") },
+            { value: "system", label: t("theme.auto") },
+          ]}
+          onChange={setMode}
+        />
       </div>
 
       <main className="auth-v1__stage">

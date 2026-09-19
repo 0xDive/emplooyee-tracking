@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { listEmployeeDevices, updateDevice } from "../../api/endpoints";
-import type { Device } from "../../api/types";
+import { ApiError, type Device, type Employee } from "../../api/types";
 import {
   Alert,
   Badge,
@@ -13,6 +13,7 @@ import {
   TextField,
 } from "../ds";
 import { useToast } from "../ToastProvider";
+import { EnrollmentTokenControl } from "./EnrollmentTokenControl";
 
 function fmtTimestamp(timestamp: number | null, never: string): string {
   if (!timestamp) return never;
@@ -28,11 +29,15 @@ function shortID(id: string): string {
 }
 
 export function DevicesCard({
+  employee,
   employeeId,
   businessId,
+  canChange = true,
 }: {
+  employee?: Employee | null;
   employeeId: string;
   businessId: string;
+  canChange?: boolean;
 }) {
   const { t } = useTranslation("dashboard");
   const { pushToast } = useToast();
@@ -82,8 +87,12 @@ export function DevicesCard({
         title: t("detail.devices.saved"),
         tone: "success",
       });
-    } catch {
-      setDialogError(t("detail.devices.actionFailed"));
+    } catch (error) {
+      setDialogError(
+        error instanceof ApiError && error.code === "device_limit_reached"
+          ? t("detail.devices.deviceLimitReached")
+          : t("detail.devices.actionFailed"),
+      );
     } finally {
       setBusyID(null);
     }
@@ -110,8 +119,12 @@ export function DevicesCard({
         title: t("detail.devices.saved"),
         tone: "success",
       });
-    } catch {
-      setDialogError(t("detail.devices.actionFailed"));
+    } catch (error) {
+      setDialogError(
+        error instanceof ApiError && error.code === "device_limit_reached"
+          ? t("detail.devices.deviceLimitReached")
+          : t("detail.devices.actionFailed"),
+      );
     } finally {
       setBusyID(null);
     }
@@ -119,10 +132,37 @@ export function DevicesCard({
 
   return (
     <Card>
-      <div className="report-card__head">
-        <h2 className="report-card__title">{t("detail.devices.title")}</h2>
-        <p className="report-card__subtitle">{t("detail.devices.subtitle")}</p>
+      <div className="report-card__head device-card__head">
+        <div>
+          <h2 className="report-card__title">{t("detail.devices.title")}</h2>
+          <p className="report-card__subtitle">{t("detail.devices.subtitle")}</p>
+        </div>
+        {employee && (
+          <EnrollmentTokenControl
+            employee={employee}
+            businessId={businessId}
+            canChange={canChange}
+            triggerLabel={t("detail.devices.reenroll")}
+          />
+        )}
       </div>
+
+      {!loading &&
+        !error &&
+        devices.some(
+          (device) => !device.revoked_at && device.version_status === "outdated",
+        ) && (
+          <div className="device-health-warning">
+            <Alert tone="warning">
+              {t("detail.devices.outdatedWarning", {
+                count: devices.filter(
+                  (device) =>
+                    !device.revoked_at && device.version_status === "outdated",
+                ).length,
+              })}
+            </Alert>
+          </div>
+        )}
 
       {loading && (
         <div className="devices-v1" aria-hidden>
@@ -165,6 +205,24 @@ export function DevicesCard({
                           : "detail.devices.active",
                       )}
                     </Badge>
+                    {revoked && canChange && (
+                      <span className="device-row__reenroll-hint">
+                        {t("detail.devices.reenrollHint")}
+                      </span>
+                    )}
+                    {!revoked && (
+                      <Badge
+                        tone={
+                          device.version_status === "current"
+                            ? "success"
+                            : device.version_status === "outdated"
+                              ? "warning"
+                              : "neutral"
+                        }
+                      >
+                        {t(`detail.devices.versionStatus.${device.version_status}`)}
+                      </Badge>
+                    )}
                   </div>
                   <div className="device-row__meta">
                     {platform || shortID(device.id)}
@@ -191,35 +249,37 @@ export function DevicesCard({
                   </div>
                 </div>
 
-                <div className="device-row__actions">
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    disabled={busyID === device.id}
-                    onClick={() => {
-                      setRenameValue(device.label || device.hostname || "");
-                      setDialogError(null);
-                      setRenameDevice(device);
-                    }}
-                  >
-                    {t("detail.devices.rename")}
-                  </Button>
-                  <Button
-                    variant={revoked ? "secondary" : "danger-ghost"}
-                    size="sm"
-                    disabled={busyID === device.id}
-                    onClick={() => {
-                      setDialogError(null);
-                      setConfirmDevice(device);
-                    }}
-                  >
-                    {t(
-                      revoked
-                        ? "detail.devices.restore"
-                        : "detail.devices.revoke",
-                    )}
-                  </Button>
-                </div>
+                {canChange && (
+                  <div className="device-row__actions">
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      disabled={busyID === device.id}
+                      onClick={() => {
+                        setRenameValue(device.label || device.hostname || "");
+                        setDialogError(null);
+                        setRenameDevice(device);
+                      }}
+                    >
+                      {t("detail.devices.rename")}
+                    </Button>
+                    <Button
+                      variant={revoked ? "secondary" : "danger-ghost"}
+                      size="sm"
+                      disabled={busyID === device.id}
+                      onClick={() => {
+                        setDialogError(null);
+                        setConfirmDevice(device);
+                      }}
+                    >
+                      {t(
+                        revoked
+                          ? "detail.devices.restore"
+                          : "detail.devices.revoke",
+                      )}
+                    </Button>
+                  </div>
+                )}
               </div>
             );
           })}

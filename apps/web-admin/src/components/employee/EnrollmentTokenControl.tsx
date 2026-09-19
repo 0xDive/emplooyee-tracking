@@ -2,7 +2,7 @@ import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { createEnrollmentToken, type EnrollmentTokenResponse } from "../../api/enrollment";
 import type { Employee } from "../../api/types";
-import { Alert, Button, Dialog, FieldFrame, TextField } from "../ds";
+import { Alert, Button, Dialog, SelectMenu, TextField } from "../ds";
 
 const INSTALLER_SCRIPT_URL =
   "https://github.com/0xDive/actilens/releases/latest/download/install-windows-agent.ps1";
@@ -36,12 +36,14 @@ export function EnrollmentTokenControl({
   businessId,
   canChange,
   triggerVariant = "button",
+  triggerLabel,
   onDialogClose,
 }: {
   employee: Employee;
   businessId: string;
   canChange: boolean;
   triggerVariant?: "button" | "menu-item";
+  triggerLabel?: string;
   onDialogClose?: () => void;
 }) {
   const { t } = useTranslation("dashboard");
@@ -105,14 +107,15 @@ export function EnrollmentTokenControl({
     }
   }
 
+  const label = triggerLabel ?? t("employees.actions.enrollment");
   const trigger =
     triggerVariant === "menu-item" ? (
       <button type="button" className="ds-menu__item" onClick={start}>
-        {t("employees.actions.enrollment")}
+        {label}
       </button>
     ) : (
       <Button variant="secondary" size="sm" onClick={start}>
-        {t("employees.actions.enrollment")}
+        {label}
       </Button>
     );
 
@@ -154,19 +157,18 @@ export function EnrollmentTokenControl({
             <Alert tone="info">{t("employees.enrollment.description")}</Alert>
 
             {!grant && (
-              <FieldFrame htmlFor="enrollment-ttl" label={t("employees.enrollment.expires")}>
-                <select
-                  id="enrollment-ttl"
-                  className="ds-select"
-                  value={hours}
-                  onChange={(event) => setHours(Number(event.target.value))}
-                >
-                  <option value={1}>{t("employees.enrollment.ttl1")}</option>
-                  <option value={24}>{t("employees.enrollment.ttl24")}</option>
-                  <option value={72}>{t("employees.enrollment.ttl72")}</option>
-                  <option value={168}>{t("employees.enrollment.ttl168")}</option>
-                </select>
-              </FieldFrame>
+              <SelectMenu
+                id="enrollment-ttl"
+                label={t("employees.enrollment.expires")}
+                value={String(hours)}
+                options={[
+                  { value: "1", label: t("employees.enrollment.ttl1") },
+                  { value: "24", label: t("employees.enrollment.ttl24") },
+                  { value: "72", label: t("employees.enrollment.ttl72") },
+                  { value: "168", label: t("employees.enrollment.ttl168") },
+                ]}
+                onChange={(value) => setHours(Number(value))}
+              />
             )}
 
             {grant && (

@@ -17,7 +17,7 @@ use std::time::Duration;
 use super::auth::AuthState;
 use super::client::BackendClient;
 use super::BATCH_LIMIT;
-use crate::storage::{Db, SyncTable};
+use crate::storage::{Db, PendingActivity, SyncTable};
 
 /// Base interval between sync passes (5 min). Backoff multiplies this on failure.
 const BASE_INTERVAL: Duration = Duration::from_secs(300);
@@ -25,6 +25,22 @@ const BASE_INTERVAL: Duration = Duration::from_secs(300);
 const MAX_INTERVAL: Duration = Duration::from_secs(16 * 60);
 /// Short delay before the first pass so startup isn't blocked.
 const STARTUP_DELAY: Duration = Duration::from_secs(10);
+
+fn apply_activity_collection_policy(
+    activity: &mut [PendingActivity],
+    collect_apps: bool,
+    collect_titles: bool,
+) {
+    for sample in activity {
+        if !collect_apps {
+            sample.app_name.clear();
+            sample.window_title = None;
+            sample.pid = None;
+        } else if !collect_titles {
+            sample.window_title = None;
+        }
+    }
+}
 
 /// Sync status surfaced to the UI / menu bar (task 53).
 #[derive(Default)]
@@ -127,30 +143,69 @@ pub async fn run_once(ctx: &SyncContext) -> PassOutcome {
 
     let client = BackendClient::new(base_url, ctx.auth.clone());
 
-    if let Ok(enabled) = client.monitoring_enabled(business_id.as_deref()).await {
-        ctx.control
-            .org_monitoring_enabled
-            .store(enabled, Ordering::Relaxed);
-        let mut current = ctx.settings.current.lock().unwrap();
-        if current.org_monitoring_enabled != enabled {
-            current.org_monitoring_enabled = enabled;
-            let _ = crate::settings::save(&ctx.settings.path, &current);
+    match client.fetch_policy(business_id.as_deref()).await {
+        Ok(policy) => {
+            let previous = ctx.settings.managed.lock().unwrap().monitoring_enabled;
+            let enabled = if policy.managed {
+                client
+                    .monitoring_enabled(business_id.as_deref())
+                    .await
+                    .unwrap_or(previous)
+            } else {
+                true
+            };
+            crate::settings::apply_managed_policy(
+                &ctx.settings,
+                &ctx.control,
+                &policy,
+                enabled,
+            );
         }
-        let mut managed = ctx.settings.managed.lock().unwrap();
-        managed.monitoring_enabled = enabled;
+        Err(e) if policy_stops_collection(&e) => {
+            // A server-authoritative lifecycle/security state must stop collection
+            // even if the UI is closed. Preserve this fail-closed state offline.
+            ctx.control.managed.store(true, Ordering::Relaxed);
+            ctx.control
+                .org_monitoring_enabled
+                .store(false, Ordering::Relaxed);
+            {
+                let mut current = ctx.settings.current.lock().unwrap();
+                current.org_monitoring_enabled = false;
+                let _ = crate::settings::save(&ctx.settings.path, &current);
+            }
+            ctx.settings.managed.lock().unwrap().monitoring_enabled = false;
+            ctx.status.record_error(e, pending_total(ctx));
+            return PassOutcome::Skipped;
+        }
+        Err(e) => {
+            // Network/server outage: retain the last server-confirmed policy instead
+            // of widening collection with local defaults.
+            crate::log_warn!("policy", "background policy refresh failed: {e}");
+        }
     }
-    // Preserve the last known state when offline. Once the server disabled this
-    // membership, collection and upload remain stopped until a later successful
-    // policy refresh explicitly re-enables them.
+
     if !ctx.control.org_monitoring_enabled.load(Ordering::Relaxed) {
         return PassOutcome::Skipped;
+    }
+
+    // Collection switches govern transmission as well as new local writes. Drop
+    // pending upload eligibility for disabled optional categories so data queued
+    // before a policy change cannot leak later if the category is re-enabled.
+    if !ctx.control.count_keystrokes.load(Ordering::Relaxed) {
+        let _ = ctx.db.suppress_pending(SyncTable::Keystroke);
+    }
+    if !ctx.control.collect_browser_activity.load(Ordering::Relaxed) {
+        let _ = ctx.db.suppress_pending(SyncTable::Browser);
+    }
+    if !ctx.control.capture_screenshots.load(Ordering::Relaxed) {
+        let _ = ctx.db.suppress_pending(SyncTable::Screenshot);
     }
 
     let mut failed = false;
 
     // --- JSON batch: activity + keystrokes + browser ---
     loop {
-        let activity = match ctx.db.pending_activity(BATCH_LIMIT) {
+        let mut activity = match ctx.db.pending_activity(BATCH_LIMIT) {
             Ok(v) => v,
             Err(e) => {
                 ctx.status
@@ -160,6 +215,13 @@ pub async fn run_once(ctx: &SyncContext) -> PassOutcome {
         };
         let keystrokes = ctx.db.pending_keystrokes(BATCH_LIMIT).unwrap_or_default();
         let browser = ctx.db.pending_browser(BATCH_LIMIT).unwrap_or_default();
+
+        // Active/idle duration is mandatory for managed mode, but app identity and
+        // titles are optional. Redact old pending rows at transmission time too,
+        // because they may have been recorded before the administrator changed policy.
+        let collect_apps = ctx.control.collect_app_activity.load(Ordering::Relaxed);
+        let collect_titles = ctx.control.collect_window_titles.load(Ordering::Relaxed);
+        apply_activity_collection_policy(&mut activity, collect_apps, collect_titles);
 
         if activity.is_empty() && keystrokes.is_empty() && browser.is_empty() {
             break;
@@ -254,6 +316,64 @@ pub async fn run_once(ctx: &SyncContext) -> PassOutcome {
     }
 }
 
+fn policy_stops_collection(message: &str) -> bool {
+    [
+        "member_blocked",
+        "member_removed",
+        "organization_archived",
+        "organization_deletion_pending",
+    ]
+    .iter()
+    .any(|code| message.contains(code))
+}
+
 fn pending_total(ctx: &SyncContext) -> i64 {
     ctx.db.pending_count().unwrap_or(0)
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pending_activity() -> PendingActivity {
+        PendingActivity {
+            client_uuid: "sample-1".into(),
+            ts: 100,
+            app_name: "Sensitive App".into(),
+            window_title: Some("Sensitive Window".into()),
+            pid: Some(42),
+            duration_s: 15,
+            updated_at: 100,
+        }
+    }
+
+    #[test]
+    fn app_collection_off_redacts_identity_before_transmission() {
+        let mut rows = vec![pending_activity()];
+        apply_activity_collection_policy(&mut rows, false, true);
+        assert_eq!(rows[0].app_name, "");
+        assert_eq!(rows[0].window_title, None);
+        assert_eq!(rows[0].pid, None);
+        assert_eq!(rows[0].duration_s, 15);
+    }
+
+    #[test]
+    fn window_title_collection_off_preserves_app_but_redacts_title() {
+        let mut rows = vec![pending_activity()];
+        apply_activity_collection_policy(&mut rows, true, false);
+        assert_eq!(rows[0].app_name, "Sensitive App");
+        assert_eq!(rows[0].window_title, None);
+        assert_eq!(rows[0].pid, Some(42));
+        assert_eq!(rows[0].duration_s, 15);
+    }
+
+    #[test]
+    fn enabled_activity_collection_keeps_identity() {
+        let mut rows = vec![pending_activity()];
+        apply_activity_collection_policy(&mut rows, true, true);
+        assert_eq!(rows[0].app_name, "Sensitive App");
+        assert_eq!(rows[0].window_title.as_deref(), Some("Sensitive Window"));
+        assert_eq!(rows[0].pid, Some(42));
+    }
 }

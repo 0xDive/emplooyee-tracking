@@ -400,3 +400,26 @@ body {
     padding: 16px;
   }
 }
+
+.login-org-list {
+  margin-top: 20px;
+}
+
+.login-org-list .persona-card {
+  width: 100%;
+  text-align: left;
+}
+
+.login-mfa-hint {
+  margin: -4px 0 0;
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 17px;
+}
+
+
+/* Production ActiLens identity. */
+.brand-logo { border-radius: 0; background: transparent; }
+.brand-logo img { display: block; width: 100%; height: 100%; object-fit: contain; }
+.welcome .brand-mark { border-radius: 0; background: transparent; box-shadow: none; }
+.welcome .brand-mark img { display: block; width: 100%; height: 100%; object-fit: contain; }

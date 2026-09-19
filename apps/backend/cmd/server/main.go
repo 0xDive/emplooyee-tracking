@@ -14,6 +14,8 @@ import (
 	"actilens/backend/internal/config"
 	"actilens/backend/internal/db"
 	"actilens/backend/internal/filestore"
+	"actilens/backend/internal/exporter"
+	"actilens/backend/internal/lifecycle"
 	"actilens/backend/internal/obs"
 	"actilens/backend/internal/retention"
 	"actilens/backend/internal/server"
@@ -70,11 +72,15 @@ func main() {
 	st := store.New(pool)
 	files := filestore.New(cfg.StorageDir)
 	ret := retention.New(st, files)
+	exp := exporter.New(st, files)
+	life := lifecycle.New(st, files)
 
-	// Hourly screenshot retention sweep (plus one on startup).
+	// Hourly retention sweep (plus one on startup).
 	sweepCtx, stopSweeper := context.WithCancel(ctx)
 	defer stopSweeper()
 	ret.StartSweeper(sweepCtx, time.Hour)
+	exp.StartWorker(sweepCtx, 2*time.Second)
+	life.StartWorker(sweepCtx, time.Minute)
 
 	srv := &http.Server{
 		Addr:    ":" + cfg.Port,

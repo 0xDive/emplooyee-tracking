@@ -92,13 +92,15 @@
         border-radius: 8px;
         display: grid;
         place-items: center;
-        background: var(--brand);
-        color: #fff;
+        background: transparent;
+        color: inherit;
       }
 
-      .brand-mark svg {
-        width: 18px;
-        height: 18px;
+      .brand-mark img {
+        width: 100%;
+        height: 100%;
+        display: block;
+        object-fit: contain;
       }
 
       .brand-copy {
@@ -204,6 +206,11 @@
         left: 2px;
       }
 
+      .switch:disabled {
+        cursor: not-allowed;
+        opacity: 0.58;
+      }
+
       .card {
         padding: 11px 12px;
         border: 1px solid var(--border-subtle);
@@ -267,16 +274,7 @@
         <header class="head">
           <div class="brand">
             <span class="brand-mark" aria-hidden>
-              <svg
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                stroke-width="2"
-                stroke-linecap="round"
-                stroke-linejoin="round"
-              >
-                <path d="M3 12h4l2-5 4 10 2-5h6"></path>
-              </svg>
+              <img src="icons/brand-mark.svg" alt="" />
             </span>
             <span class="brand-copy">
               <span class="brand-name">ActiLens</span>
@@ -290,7 +288,7 @@
           <div class="tracking-row">
             <div>
               <div class="title">Track this browser</div>
-              <div class="muted">Send active-tab activity to the local app</div>
+              <div id="trackingHelp" class="muted">Send active-tab activity to the local app</div>
             </div>
             <button
               id="toggle"

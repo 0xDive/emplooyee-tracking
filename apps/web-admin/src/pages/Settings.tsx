@@ -1,32 +1,37 @@
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
 import {
-  cleanupScreenshots,
-  getPrivacyApps,
+  cleanupData,
+  previewCleanupRange,
+  previewRetention,
   updateBusinessSettings,
+  type RetentionDataClass,
+  type RetentionPreview,
 } from "../api/endpoints";
 import {
   ApiError,
   type BusinessSettingsPatch,
-  type PrivacyAppCategory,
-  type ScreenshotMode,
 } from "../api/types";
-import { useAuth } from "../auth/AuthContext";
 import {
   Alert,
   Button,
   Card,
   Dialog,
   EmptyState,
-  PageHeader,
   Skeleton,
-  TextField,
 } from "../components/ds";
 import { useToast } from "../components/ToastProvider";
 import { AuditLogCard } from "../components/settings/AuditLogCard";
+import { OrganizationSettingsCard } from "../components/settings/OrganizationSettingsCard";
+import { OrganizationLifecycleCard } from "../components/settings/OrganizationLifecycleCard";
+import { MonitoringSettingsCard } from "../components/settings/MonitoringSettingsCard";
+import { ScreenshotPolicyCard } from "../components/settings/ScreenshotPolicyCard";
+import { DeviceEnrollmentSettingsCard } from "../components/settings/DeviceEnrollmentSettingsCard";
+import { ExportSettingsCard } from "../components/settings/ExportSettingsCard";
+import { PrivacyRulesDialog } from "../components/settings/PrivacyRulesDialog";
 import { useBusinesses } from "../useBusinesses";
-import { memberTerms } from "../terms";
 import { canManageSettings } from "../rbac";
+import { dayRangeToUnix, isoDateInTimeZone } from "../format";
 import "../theme/settings-v1.css";
 
 function formatBytes(value: number): string {
@@ -37,30 +42,32 @@ function formatBytes(value: number): string {
 
 const CLEANUP_PRESETS = [7, 14, 30, 90];
 
-const INTERVAL_PRESETS = [
-  { minutes: 1, value: 60 },
-  { minutes: 5, value: 300 },
-  { minutes: 10, value: 600 },
-  { minutes: 15, value: 900 },
+const CLEANUP_DATA_CLASSES: RetentionDataClass[] = [
+  "activity",
+  "screenshots",
+  "browser",
+  "keystrokes",
 ];
 
-const IDLE_PRESETS = [
-  { minutes: 1, value: 60 },
-  { minutes: 3, value: 180 },
-  { minutes: 5, value: 300 },
-];
+type RetentionField =
+  | "activity_retention_days"
+  | "screenshot_retention_days"
+  | "browser_retention_days"
+  | "keystroke_retention_days";
 
-const RETENTION_PRESETS: Array<{ days: number | null; value: number | null }> = [
-  { days: 7, value: 7 },
-  { days: 14, value: 14 },
-  { days: 30, value: 30 },
-  { days: 90, value: 90 },
-  { days: null, value: null },
-];
+type PendingRetentionChange = {
+  field: RetentionField;
+  dataClass: RetentionDataClass;
+  value: number;
+  preview: RetentionPreview;
+};
 
-function normalizeMode(mode: string | undefined): ScreenshotMode {
-  return mode === "normal" || mode === "full_screen" ? "normal" : "privacy";
-}
+const RETENTION_PRESETS: Record<RetentionField, Array<number | null>> = {
+  activity_retention_days: [30, 90, 180, 365],
+  screenshot_retention_days: [7, 14, 30, 90, null],
+  browser_retention_days: [30, 90, 180, 365],
+  keystroke_retention_days: [30, 90, 180, 365],
+};
 
 function SettingsSection({
   id,
@@ -143,65 +150,31 @@ function Segmented<T extends string | number>({
   );
 }
 
-function ModeOption({
-  label,
-  description,
-  selected,
-  disabled,
-  onSelect,
-}: {
-  label: string;
-  description: string;
-  selected: boolean;
-  disabled?: boolean;
-  onSelect: () => void;
-}) {
-  return (
-    <button
-      type="button"
-      role="radio"
-      aria-checked={selected}
-      className={`settings-mode${selected ? " is-active" : ""}`}
-      disabled={disabled}
-      onClick={onSelect}
-    >
-      <span className="settings-mode__radio" aria-hidden />
-      <span>
-        <span className="settings-mode__label">{label}</span>
-        <span className="settings-mode__description">{description}</span>
-      </span>
-    </button>
-  );
-}
-
 export function Settings() {
   const { t } = useTranslation("settings");
-  const { user } = useAuth();
   const { pushToast } = useToast();
   const { businesses, selected, selectedId, loading, reload } = useBusinesses();
-  const terms = memberTerms(selected?.kind);
   const mayManageSettings = canManageSettings(selected?.role);
+  const organizationReadOnly = Boolean(
+    selected?.archived_at || selected?.deletion_scheduled_at,
+  );
 
   const [activeSection, setActiveSection] = useState("organization");
-  const [retention, setRetention] = useState<number | null>(null);
   const [saving, setSaving] = useState(false);
-  const [skipAppInput, setSkipAppInput] = useState("");
-  const [skipOpen, setSkipOpen] = useState(false);
-  const [privacyApps, setPrivacyApps] = useState<PrivacyAppCategory[]>([]);
+  const [pendingRetention, setPendingRetention] =
+    useState<PendingRetentionChange | null>(null);
+  const [privacyOpen, setPrivacyOpen] = useState(false);
   const [cleanupOpen, setCleanupOpen] = useState(false);
+  const [cleanupMode, setCleanupMode] = useState<"older" | "range">("older");
   const [cleanupDays, setCleanupDays] = useState(30);
+  const [cleanupFrom, setCleanupFrom] = useState("");
+  const [cleanupTo, setCleanupTo] = useState("");
+  const [cleanupClasses, setCleanupClasses] =
+    useState<RetentionDataClass[]>(["screenshots"]);
+  const [cleanupPreview, setCleanupPreview] = useState<RetentionPreview[]>([]);
+  const [cleanupPreviewing, setCleanupPreviewing] = useState(false);
   const [cleaning, setCleaning] = useState(false);
   const [dialogError, setDialogError] = useState<string | null>(null);
-
-  useEffect(() => {
-    getPrivacyApps()
-      .then((response) => setPrivacyApps(response.categories))
-      .catch(() => {});
-  }, []);
-
-  useEffect(() => {
-    if (selected) setRetention(selected.screenshot_retention_days);
-  }, [selected]);
 
   async function savePatch(
     patch: BusinessSettingsPatch,
@@ -224,79 +197,232 @@ export function Settings() {
     }
   }
 
-  function saveRetention(value: number | null) {
-    setRetention(value);
-    savePatch({ screenshot_retention_days: value }, t("retention.saved"));
-  }
+  async function changeRetention(
+    field: RetentionField,
+    dataClass: RetentionDataClass,
+    currentValue: number | null,
+    nextValue: number | null,
+  ) {
+    if (!selectedId || currentValue === nextValue) return;
 
-  const skipApps = selected?.screenshot_skip_apps ?? [];
-  const hasSkipApp = (app: string) =>
-    skipApps.some((value) => value.toLowerCase() === app.toLowerCase());
+    const reduction =
+      nextValue !== null &&
+      (currentValue === null || nextValue < currentValue);
 
-  const suggestedLower = useMemo(
-    () =>
-      new Set(
-        privacyApps.flatMap((category) =>
-          category.apps.map((app) => app.toLowerCase()),
-        ),
-      ),
-    [privacyApps],
-  );
-
-  const customSkipApps = skipApps.filter(
-    (app) => !suggestedLower.has(app.toLowerCase()),
-  );
-
-  function saveMode(mode: ScreenshotMode) {
-    const patch: BusinessSettingsPatch = { screenshot_mode: mode };
-    if (
-      mode === "privacy" &&
-      skipApps.length === 0 &&
-      privacyApps.length > 0
-    ) {
-      patch.screenshot_skip_apps = privacyApps.flatMap(
-        (category) => category.apps,
+    if (!reduction) {
+      await savePatch(
+        { [field]: nextValue } as BusinessSettingsPatch,
+        t("retention.saved"),
       );
+      return;
     }
-    savePatch(patch, t("screenshotMode.saved"));
+
+    setSaving(true);
+    try {
+      const preview = await previewRetention(selectedId, dataClass, nextValue);
+      setPendingRetention({
+        field,
+        dataClass,
+        value: nextValue,
+        preview,
+      });
+    } catch (error) {
+      pushToast({
+        title: error instanceof ApiError ? error.message : t("retention.previewFailed"),
+        tone: "danger",
+      });
+    } finally {
+      setSaving(false);
+    }
   }
 
-  function addSkipApps(apps: string[]) {
-    const fresh = apps.filter((app) => !hasSkipApp(app));
-    if (!fresh.length) return;
-    savePatch(
-      { screenshot_skip_apps: [...skipApps, ...fresh] },
-      t("skipApps.saved"),
+  async function confirmRetentionReduction() {
+    if (!selectedId || !pendingRetention) return;
+
+    setSaving(true);
+    try {
+      await updateBusinessSettings(
+        selectedId,
+        { [pendingRetention.field]: pendingRetention.value } as BusinessSettingsPatch,
+        true,
+      );
+      setPendingRetention(null);
+      await reload();
+      pushToast({ title: t("retention.saved"), tone: "success" });
+    } catch (error) {
+      pushToast({
+        title: error instanceof ApiError ? error.message : t("saveError"),
+        tone: "danger",
+      });
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function refreshCleanupPreview(
+    classes = cleanupClasses,
+    mode = cleanupMode,
+    days = cleanupDays,
+    fromDate = cleanupFrom,
+    toDate = cleanupTo,
+  ) {
+    if (!selectedId || classes.length === 0) {
+      setCleanupPreview([]);
+      return;
+    }
+
+    setCleanupPreviewing(true);
+    setDialogError(null);
+    try {
+      let previews: RetentionPreview[];
+      if (mode === "range") {
+        if (!fromDate || !toDate || fromDate > toDate) {
+          setCleanupPreview([]);
+          setDialogError(t("cleanup.invalidRange"));
+          return;
+        }
+        const bounds = dayRangeToUnix(
+          fromDate,
+          toDate,
+          selected?.timezone || "UTC",
+        );
+        previews = await Promise.all(
+          classes.map((dataClass) =>
+            previewCleanupRange(
+              selectedId,
+              dataClass,
+              bounds.from,
+              bounds.to,
+            ),
+          ),
+        );
+      } else {
+        previews = await Promise.all(
+          classes.map((dataClass) =>
+            previewRetention(selectedId, dataClass, days),
+          ),
+        );
+      }
+      setCleanupPreview(previews);
+    } catch (error) {
+      setCleanupPreview([]);
+      setDialogError(
+        error instanceof ApiError ? error.message : t("cleanup.previewFailed"),
+      );
+    } finally {
+      setCleanupPreviewing(false);
+    }
+  }
+
+  function openCleanupDialog() {
+    setDialogError(null);
+    setCleanupOpen(true);
+    void refreshCleanupPreview();
+  }
+
+  function toggleCleanupClass(dataClass: RetentionDataClass, checked: boolean) {
+    const next = checked
+      ? Array.from(new Set([...cleanupClasses, dataClass]))
+      : cleanupClasses.filter((value) => value !== dataClass);
+    setCleanupClasses(next);
+    void refreshCleanupPreview(
+      next,
+      cleanupMode,
+      cleanupDays,
+      cleanupFrom,
+      cleanupTo,
     );
   }
 
-  function removeSkipApps(apps: string[]) {
-    const drop = new Set(apps.map((app) => app.toLowerCase()));
-    savePatch(
-      {
-        screenshot_skip_apps: skipApps.filter(
-          (app) => !drop.has(app.toLowerCase()),
-        ),
-      },
-      t("skipApps.saved"),
+  function changeCleanupDays(days: number) {
+    setCleanupDays(days);
+    void refreshCleanupPreview(
+      cleanupClasses,
+      "older",
+      days,
+      cleanupFrom,
+      cleanupTo,
     );
   }
 
-  function addSkipApp() {
-    const name = skipAppInput.trim();
-    if (!name) return;
-    setSkipAppInput("");
-    addSkipApps([name]);
+  function changeCleanupMode(mode: "older" | "range") {
+    setCleanupMode(mode);
+    if (mode === "range") {
+      const today = isoDateInTimeZone(
+        new Date(),
+        selected?.timezone || "UTC",
+      );
+      const from = cleanupFrom || today;
+      const to = cleanupTo || today;
+      setCleanupFrom(from);
+      setCleanupTo(to);
+      void refreshCleanupPreview(
+        cleanupClasses,
+        mode,
+        cleanupDays,
+        from,
+        to,
+      );
+      return;
+    }
+    void refreshCleanupPreview(
+      cleanupClasses,
+      mode,
+      cleanupDays,
+      cleanupFrom,
+      cleanupTo,
+    );
+  }
+
+  function changeCleanupFrom(value: string) {
+    setCleanupFrom(value);
+    void refreshCleanupPreview(
+      cleanupClasses,
+      "range",
+      cleanupDays,
+      value,
+      cleanupTo,
+    );
+  }
+
+  function changeCleanupTo(value: string) {
+    setCleanupTo(value);
+    void refreshCleanupPreview(
+      cleanupClasses,
+      "range",
+      cleanupDays,
+      cleanupFrom,
+      value,
+    );
   }
 
   async function runCleanup() {
-    if (!selectedId) return;
+    if (!selectedId || cleanupClasses.length === 0) return;
 
     setCleaning(true);
     setDialogError(null);
 
     try {
-      const response = await cleanupScreenshots(selectedId, cleanupDays);
+      const window =
+        cleanupMode === "range"
+          ? (() => {
+              if (!cleanupFrom || !cleanupTo || cleanupFrom > cleanupTo) {
+                throw new Error(t("cleanup.invalidRange"));
+              }
+              return dayRangeToUnix(
+                cleanupFrom,
+                cleanupTo,
+                selected?.timezone || "UTC",
+              );
+            })()
+          : null;
+      const response = await cleanupData(
+        selectedId,
+        cleanupClasses,
+        window
+          ? { from: window.from, to: window.to }
+          : { older_than_days: cleanupDays },
+      );
       setCleanupOpen(false);
       pushToast({
         title: t("cleanup.removed", {
@@ -307,21 +433,77 @@ export function Settings() {
       });
     } catch (error) {
       setDialogError(
-        error instanceof ApiError ? error.message : t("cleanup.failed"),
+        error instanceof ApiError || error instanceof Error
+          ? error.message
+          : t("cleanup.failed"),
       );
     } finally {
       setCleaning(false);
     }
   }
 
-  const nav = [
-    ["organization", t("v1.sections.organization")],
-    ["monitoring", t("v1.sections.monitoring")],
-    ["screenshots", t("v1.sections.screenshots")],
-    ["storage", t("v1.sections.storage")],
-    ["audit", t("v1.sections.audit")],
-    ["account", t("v1.sections.account")],
-  ] as const;
+  const nav = organizationReadOnly
+    ? ([
+        ["organization", t("v1.sections.organization")],
+        ["storage", t("v1.sections.storage")],
+        ["audit", t("v1.sections.audit")],
+      ] as const)
+    : ([
+        ["organization", t("v1.sections.organization")],
+        ["monitoring", t("v1.sections.monitoring")],
+        ["screenshots", t("v1.sections.screenshots")],
+        ["devices", t("v1.sections.devices")],
+        ["storage", t("v1.sections.storage")],
+        ["audit", t("v1.sections.audit")],
+      ] as const);
+
+  useEffect(() => {
+    if (!selectedId) return;
+
+    const root = document.querySelector<HTMLElement>(".ds-shell-content");
+    if (!root) return;
+
+    const ids = organizationReadOnly
+      ? ["organization", "storage", "audit"]
+      : ["organization", "monitoring", "screenshots", "devices", "storage", "audit"];
+    const sections = ids
+      .map((id) => document.getElementById(id))
+      .filter((section): section is HTMLElement => Boolean(section));
+    if (sections.length === 0) return;
+
+    let frame = 0;
+    const updateActiveSection = () => {
+      cancelAnimationFrame(frame);
+      frame = requestAnimationFrame(() => {
+        const markerY = root.getBoundingClientRect().top + 112;
+        let current = sections[0].id;
+
+        for (const section of sections) {
+          if (section.getBoundingClientRect().top <= markerY) {
+            current = section.id;
+          } else {
+            break;
+          }
+        }
+
+        if (root.scrollTop + root.clientHeight >= root.scrollHeight - 12) {
+          current = sections[sections.length - 1].id;
+        }
+
+        setActiveSection(current);
+      });
+    };
+
+    updateActiveSection();
+    root.addEventListener("scroll", updateActiveSection, { passive: true });
+    window.addEventListener("resize", updateActiveSection);
+
+    return () => {
+      cancelAnimationFrame(frame);
+      root.removeEventListener("scroll", updateActiveSection);
+      window.removeEventListener("resize", updateActiveSection);
+    };
+  }, [organizationReadOnly, selectedId]);
 
   function goToSection(id: string) {
     setActiveSection(id);
@@ -333,15 +515,6 @@ export function Settings() {
 
   return (
     <div className="settings-v1">
-      <PageHeader
-        title={t("title")}
-        subtitle={
-          selected
-            ? t("v1.subtitle", { name: selected.name })
-            : undefined
-        }
-      />
-
       {loading && (
         <div className="settings-layout" aria-hidden>
           <Skeleton width={180} height={220} />
@@ -387,224 +560,120 @@ export function Settings() {
               title={t("v1.sections.organization")}
               description={t("v1.organization.description")}
             >
-              <Card className="settings-card">
-                <SettingsRow title={t("v1.organization.name")}>
-                  <div className="settings-readonly">
-                    <span className="settings-readonly__value">
-                      {selected.name}
-                    </span>
-                  </div>
-                </SettingsRow>
-                <SettingsRow title={t("v1.organization.type")}>
-                  <div className="settings-readonly">
-                    <span className="settings-readonly__value">
-                      {selected.kind === "family"
-                        ? t("v1.organization.family")
-                        : t("v1.organization.team")}
-                    </span>
-                  </div>
-                </SettingsRow>
-                <SettingsRow title={t("v1.organization.yourRole")}>
-                  <div className="settings-readonly">
-                    <span className="settings-readonly__value">
-                      {t(`v1.roles.${selected.role}`)}
-                    </span>
-                  </div>
-                </SettingsRow>
-              </Card>
+              {!organizationReadOnly && (
+                <OrganizationSettingsCard
+                  access={{ business: selected, role: selected.role }}
+                  onReload={reload}
+                />
+              )}
+              <OrganizationLifecycleCard
+                access={{ business: selected, role: selected.role }}
+                onReload={reload}
+              />
             </SettingsSection>
 
-            <SettingsSection
-              id="monitoring"
-              title={t("v1.sections.monitoring")}
-              description={t("v1.monitoring.description")}
-            >
-              <Card className="settings-card">
-                <SettingsRow
-                  title={t("capturePolicy.title")}
-                  description={t("capturePolicy.desc", {
-                    members: terms.many,
-                  })}
+            {!organizationReadOnly && (
+              <>
+                <SettingsSection
+                  id="monitoring"
+                  title={t("v1.sections.monitoring")}
+                  description={t("v1.monitoring.description")}
                 >
-                  <Segmented
-                    value={
-                      selected.allow_employee_override ? "override" : "locked"
-                    }
-                    ariaLabel={t("capturePolicy.ariaLabel", {
-                      member: terms.lowerOne,
-                    })}
-                    disabled={saving}
-                    options={[
-                      {
-                        value: "locked",
-                        label: t("capturePolicy.locked"),
-                      },
-                      {
-                        value: "override",
-                        label: t("capturePolicy.allowOverride"),
-                      },
-                    ]}
-                    onChange={(value) =>
-                      savePatch(
-                        {
-                          allow_employee_override: value === "override",
-                        },
-                        value === "override"
-                          ? t("capturePolicy.savedAllowed", {
-                              members: terms.many,
-                            })
-                          : t("capturePolicy.savedLocked", {
-                              members: terms.many,
-                            }),
-                      )
-                    }
+                  <MonitoringSettingsCard
+                    access={{ business: selected, role: selected.role }}
+                    onReload={reload}
                   />
-                </SettingsRow>
+                </SettingsSection>
 
-                <SettingsRow
-                  title={t("idleThreshold.title")}
-                  description={t("idleThreshold.desc")}
+                <SettingsSection
+                  id="screenshots"
+                  title={t("v1.sections.screenshots")}
+                  description={t("v1.screenshots.description")}
                 >
-                  <Segmented
-                    value={selected.idle_threshold_s}
-                    ariaLabel={t("idleThreshold.ariaLabel")}
-                    disabled={saving}
-                    options={IDLE_PRESETS.map((preset) => ({
-                      value: preset.value,
-                      label: t("presets.min", {
-                        count: preset.minutes,
-                      }),
-                    }))}
-                    onChange={(value) =>
-                      savePatch(
-                        { idle_threshold_s: value },
-                        t("idleThreshold.saved"),
-                      )
-                    }
+                  <ScreenshotPolicyCard
+                    access={{ business: selected, role: selected.role }}
+                    onReload={reload}
+                    onManagePrivacy={() => setPrivacyOpen(true)}
                   />
-                </SettingsRow>
-              </Card>
-            </SettingsSection>
+                </SettingsSection>
 
-            <SettingsSection
-              id="screenshots"
-              title={t("v1.sections.screenshots")}
-              description={t("v1.screenshots.description")}
-            >
-              <Card className="settings-card">
-                <SettingsRow
-                  top
-                  title={t("screenshotMode.title")}
-                  description={t("screenshotMode.desc")}
+                <SettingsSection
+                  id="devices"
+                  title={t("v1.sections.devices")}
+                  description={t("v1.devices.description")}
                 >
-                  <div
-                    className="settings-mode-grid"
-                    role="radiogroup"
-                    aria-label={t("screenshotMode.ariaLabel")}
-                  >
-                    <ModeOption
-                      label={t("screenshotMode.privacy")}
-                      description={t("screenshotMode.privacyDesc")}
-                      selected={
-                        normalizeMode(selected.screenshot_mode) === "privacy"
-                      }
-                      disabled={saving}
-                      onSelect={() => saveMode("privacy")}
-                    />
-                    <ModeOption
-                      label={t("screenshotMode.normal")}
-                      description={t("screenshotMode.normalDesc")}
-                      selected={
-                        normalizeMode(selected.screenshot_mode) === "normal"
-                      }
-                      disabled={saving}
-                      onSelect={() => saveMode("normal")}
-                    />
-                  </div>
-                </SettingsRow>
-
-                <SettingsRow
-                  title={t("screenshotInterval.title")}
-                  description={t("screenshotInterval.desc", {
-                    member: terms.lowerOne,
-                  })}
-                >
-                  <Segmented
-                    value={selected.screenshot_interval_s}
-                    ariaLabel={t("screenshotInterval.ariaLabel")}
-                    disabled={saving}
-                    options={INTERVAL_PRESETS.map((preset) => ({
-                      value: preset.value,
-                      label: t("presets.min", {
-                        count: preset.minutes,
-                      }),
-                    }))}
-                    onChange={(value) =>
-                      savePatch(
-                        { screenshot_interval_s: value },
-                        t("screenshotInterval.saved"),
-                      )
-                    }
+                  <DeviceEnrollmentSettingsCard
+                    access={{ business: selected, role: selected.role }}
+                    onReload={reload}
                   />
-                </SettingsRow>
-
-                {normalizeMode(selected.screenshot_mode) === "privacy" && (
-                  <SettingsRow
-                    title={t("skipApps.title")}
-                    description={t("skipApps.desc")}
-                  >
-                    <div className="settings-inline">
-                      <span className="settings-count">
-                        {t("skipApps.count", {
-                          count: skipApps.length,
-                        })}
-                      </span>
-                      <Button
-                        variant="secondary"
-                        size="sm"
-                        disabled={saving}
-                        onClick={() => setSkipOpen(true)}
-                      >
-                        {t("skipApps.manage")}
-                      </Button>
-                    </div>
-                  </SettingsRow>
-                )}
-              </Card>
-            </SettingsSection>
+                </SettingsSection>
+              </>
+            )}
 
             <SettingsSection
               id="storage"
               title={t("v1.sections.storage")}
               description={t("v1.storage.description")}
             >
-              <Card className="settings-card">
-                <SettingsRow
-                  title={t("retention.title")}
-                  description={t("retention.desc", {
-                    name: selected.name,
-                  })}
-                >
-                  <Segmented
-                    value={String(retention)}
-                    ariaLabel={t("retention.ariaLabel")}
-                    disabled={saving}
-                    options={RETENTION_PRESETS.map((preset) => ({
-                      value: String(preset.value),
-                      label:
-                        preset.days === null
-                          ? t("presets.never")
-                          : t("presets.days", {
-                              count: preset.days,
-                            }),
-                    }))}
-                    onChange={(value) =>
-                      saveRetention(
-                        value === "null" ? null : Number(value),
-                      )
-                    }
-                  />
-                </SettingsRow>
+              {!organizationReadOnly && (
+                <Card className="settings-card">
+                {([
+                  {
+                    field: "activity_retention_days",
+                    dataClass: "activity",
+                    value: selected.activity_retention_days,
+                    title: t("retention.activity"),
+                    description: t("retention.activityDesc"),
+                  },
+                  {
+                    field: "screenshot_retention_days",
+                    dataClass: "screenshots",
+                    value: selected.screenshot_retention_days,
+                    title: t("retention.screenshots"),
+                    description: t("retention.screenshotsDesc"),
+                  },
+                  {
+                    field: "browser_retention_days",
+                    dataClass: "browser",
+                    value: selected.browser_retention_days,
+                    title: t("retention.browser"),
+                    description: t("retention.browserDesc"),
+                  },
+                  {
+                    field: "keystroke_retention_days",
+                    dataClass: "keystrokes",
+                    value: selected.keystroke_retention_days,
+                    title: t("retention.keystrokes"),
+                    description: t("retention.keystrokesDesc"),
+                  },
+                ] as const).map((item) => (
+                  <SettingsRow
+                    key={item.field}
+                    title={item.title}
+                    description={item.description}
+                  >
+                    <Segmented
+                      value={String(item.value)}
+                      ariaLabel={item.title}
+                      disabled={saving}
+                      options={RETENTION_PRESETS[item.field].map((days) => ({
+                        value: String(days),
+                        label:
+                          days === null
+                            ? t("presets.never")
+                            : t("presets.days", { count: days }),
+                      }))}
+                      onChange={(value) =>
+                        changeRetention(
+                          item.field,
+                          item.dataClass,
+                          item.value,
+                          value === "null" ? null : Number(value),
+                        )
+                      }
+                    />
+                  </SettingsRow>
+                ))}
 
                 <SettingsRow
                   title={t("cleanup.title")}
@@ -616,15 +685,14 @@ export function Settings() {
                     variant="danger-ghost"
                     size="sm"
                     disabled={cleaning}
-                    onClick={() => {
-                      setDialogError(null);
-                      setCleanupOpen(true);
-                    }}
+                    onClick={openCleanupDialog}
                   >
                     {t("cleanup.button")}
                   </Button>
                 </SettingsRow>
-              </Card>
+                </Card>
+              )}
+              {selectedId && <ExportSettingsCard businessId={selectedId} />}
             </SettingsSection>
 
             {selectedId && (
@@ -637,163 +705,64 @@ export function Settings() {
               </SettingsSection>
             )}
 
-            <SettingsSection
-              id="account"
-              title={t("v1.sections.account")}
-              description={t("v1.account.description")}
-            >
-              <Card className="settings-card">
-                <SettingsRow title={t("account.email")}>
-                  <div className="settings-readonly">
-                    <span className="settings-readonly__value">
-                      {user?.email || user?.username || "—"}
-                    </span>
-                  </div>
-                </SettingsRow>
-                <SettingsRow title={t("account.displayName")}>
-                  <div className="settings-readonly">
-                    <span className="settings-readonly__value">
-                      {user?.display_name || user?.username || "—"}
-                    </span>
-                  </div>
-                </SettingsRow>
-              </Card>
-            </SettingsSection>
           </div>
         </div>
       )}
 
-      {skipOpen && selected && (
+      {selectedId && !organizationReadOnly && (
+        <PrivacyRulesDialog
+          businessId={selectedId}
+          open={privacyOpen}
+          onClose={() => setPrivacyOpen(false)}
+        />
+      )}
+
+      {!organizationReadOnly && pendingRetention && (
         <Dialog
-          title={t("skipApps.modalTitle")}
-          size="complex"
-          onClose={() => !saving && setSkipOpen(false)}
+          title={t("retention.confirmTitle")}
+          size="confirm"
+          onClose={() => !saving && setPendingRetention(null)}
           closeOnBackdrop={!saving}
           footer={
-            <Button variant="primary" onClick={() => setSkipOpen(false)}>
-              {t("skipApps.done")}
-            </Button>
+            <>
+              <Button
+                variant="secondary"
+                disabled={saving}
+                onClick={() => setPendingRetention(null)}
+              >
+                {t("retention.cancel")}
+              </Button>
+              <Button
+                variant="danger"
+                loading={saving}
+                onClick={confirmRetentionReduction}
+              >
+                {t("retention.confirm")}
+              </Button>
+            </>
           }
         >
           <div className="settings-dialog-stack">
-            <p className="settings-section__description">
-              {t("skipApps.desc")}
+            <Alert tone="warning">
+              {pendingRetention.dataClass === "screenshots"
+                ? t("retention.previewScreenshots", {
+                    count: pendingRetention.preview.affected_count,
+                    size: formatBytes(pendingRetention.preview.bytes_freed),
+                    days: pendingRetention.value,
+                  })
+                : t("retention.previewRows", {
+                    count: pendingRetention.preview.affected_count,
+                    days: pendingRetention.value,
+                  })}
+            </Alert>
+            <p className="settings-dialog-copy">
+              {t("retention.workerNotice")}
             </p>
-
-            <div className="settings-inline">
-              <div className="settings-skip-input">
-                <TextField
-                  id="skip-app-input"
-                  label={t("skipApps.custom")}
-                  value={skipAppInput}
-                  placeholder={t("skipApps.placeholder")}
-                  disabled={saving}
-                  autoFocus
-                  onChange={(event) => setSkipAppInput(event.target.value)}
-                  onKeyDown={(event) => {
-                    if (event.key === "Enter") {
-                      event.preventDefault();
-                      addSkipApp();
-                    }
-                  }}
-                />
-              </div>
-              <Button
-                variant="secondary"
-                disabled={saving || !skipAppInput.trim()}
-                onClick={addSkipApp}
-              >
-                {t("skipApps.add")}
-              </Button>
-            </div>
-
-            {customSkipApps.length > 0 && (
-              <div>
-                <div className="settings-row__title">
-                  {t("skipApps.custom")}
-                </div>
-                <div className="settings-chip-group settings-chip-group--top">
-                  {customSkipApps.map((app) => (
-                    <button
-                      key={app}
-                      type="button"
-                      className="settings-chip is-active"
-                      disabled={saving}
-                      onClick={() => removeSkipApps([app])}
-                    >
-                      {app} ×
-                    </button>
-                  ))}
-                </div>
-              </div>
-            )}
-
-            <div className="settings-skip-list">
-              {privacyApps.map((category) => {
-                const added = category.apps.filter(hasSkipApp);
-                return (
-                  <div className="settings-skip-category" key={category.key}>
-                    <div className="settings-skip-category__head">
-                      <span className="settings-skip-category__name">
-                        {t(`skipApps.cat${category.key}`)} ({added.length}/
-                        {category.apps.length})
-                      </span>
-                      {added.length < category.apps.length && (
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          disabled={saving}
-                          onClick={() => addSkipApps(category.apps)}
-                        >
-                          {t("skipApps.addAll")}
-                        </Button>
-                      )}
-                      {added.length > 0 && (
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          disabled={saving}
-                          onClick={() => removeSkipApps(category.apps)}
-                        >
-                          {t("skipApps.removeAll")}
-                        </Button>
-                      )}
-                    </div>
-
-                    <div className="settings-chip-group">
-                      {category.apps.map((app) => {
-                        const active = hasSkipApp(app);
-                        return (
-                          <button
-                            key={app}
-                            type="button"
-                            role="checkbox"
-                            aria-checked={active}
-                            className={`settings-chip${
-                              active ? " is-active" : ""
-                            }`}
-                            disabled={saving}
-                            onClick={() =>
-                              active
-                                ? removeSkipApps([app])
-                                : addSkipApps([app])
-                            }
-                          >
-                            {active ? "✓ " : "+ "}
-                            {app}
-                          </button>
-                        );
-                      })}
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
           </div>
         </Dialog>
       )}
 
-      {cleanupOpen && selected && (
+      {!organizationReadOnly && cleanupOpen && selected && (
         <Dialog
           title={t("cleanup.modalTitle")}
           size="confirm"
@@ -811,27 +780,128 @@ export function Settings() {
               <Button
                 variant="danger"
                 loading={cleaning}
+                disabled={
+                  cleanupPreviewing ||
+                  cleanupClasses.length === 0 ||
+                  cleanupPreview.length !== cleanupClasses.length ||
+                  (cleanupMode === "range" &&
+                    (!cleanupFrom || !cleanupTo || cleanupFrom > cleanupTo))
+                }
                 onClick={runCleanup}
               >
-                {t("cleanup.delete", { days: cleanupDays })}
+                {cleanupMode === "range"
+                  ? t("cleanup.deleteRange")
+                  : t("cleanup.delete", { days: cleanupDays })}
               </Button>
             </>
           }
         >
           <div className="settings-dialog-stack">
             <Alert tone="warning">
-              {t("cleanup.warning", { days: cleanupDays })}
+              {cleanupMode === "range"
+                ? t("cleanup.warningRange", {
+                    from: cleanupFrom,
+                    to: cleanupTo,
+                  })
+                : t("cleanup.warning", { days: cleanupDays })}
             </Alert>
+            <div className="settings-dialog-stack">
+              <div className="settings-row__title">{t("cleanup.dataClasses")}</div>
+              {CLEANUP_DATA_CLASSES.map((dataClass) => (
+                <label key={dataClass} className="settings-cleanup-check">
+                  <input
+                    type="checkbox"
+                    checked={cleanupClasses.includes(dataClass)}
+                    disabled={cleaning}
+                    onChange={(event) =>
+                      toggleCleanupClass(dataClass, event.currentTarget.checked)
+                    }
+                  />
+                  <span>{t(`cleanup.classes.${dataClass}`)}</span>
+                </label>
+              ))}
+            </div>
             <Segmented
-              value={cleanupDays}
-              ariaLabel={t("cleanup.olderThanAriaLabel")}
+              value={cleanupMode}
+              ariaLabel={t("cleanup.modeAriaLabel")}
               disabled={cleaning}
-              options={CLEANUP_PRESETS.map((days) => ({
-                value: days,
-                label: t("presets.days", { count: days }),
-              }))}
-              onChange={setCleanupDays}
+              options={[
+                { value: "older" as const, label: t("cleanup.modeOlder") },
+                { value: "range" as const, label: t("cleanup.modeRange") },
+              ]}
+              onChange={changeCleanupMode}
             />
+            {cleanupMode === "older" ? (
+              <Segmented
+                value={cleanupDays}
+                ariaLabel={t("cleanup.olderThanAriaLabel")}
+                disabled={cleaning}
+                options={CLEANUP_PRESETS.map((days) => ({
+                  value: days,
+                  label: t("presets.days", { count: days }),
+                }))}
+                onChange={changeCleanupDays}
+              />
+            ) : (
+              <div className="settings-cleanup-range">
+                <label>
+                  <span>{t("cleanup.from")}</span>
+                  <input
+                    className="ds-input"
+                    type="date"
+                    value={cleanupFrom}
+                    max={cleanupTo || undefined}
+                    disabled={cleaning}
+                    onChange={(event) =>
+                      changeCleanupFrom(event.currentTarget.value)
+                    }
+                  />
+                </label>
+                <label>
+                  <span>{t("cleanup.to")}</span>
+                  <input
+                    className="ds-input"
+                    type="date"
+                    value={cleanupTo}
+                    min={cleanupFrom || undefined}
+                    disabled={cleaning}
+                    onChange={(event) =>
+                      changeCleanupTo(event.currentTarget.value)
+                    }
+                  />
+                </label>
+                <div className="settings-row__description">
+                  {t("cleanup.rangeTimezone", {
+                    timezone: selected.timezone || "UTC",
+                  })}
+                </div>
+              </div>
+            )}
+            <div className="settings-cleanup-preview">
+              <div className="settings-row__title">{t("cleanup.previewTitle")}</div>
+              {cleanupPreviewing ? (
+                <div className="settings-row__description">
+                  {t("cleanup.previewing")}
+                </div>
+              ) : cleanupClasses.length === 0 ? (
+                <div className="settings-row__description">
+                  {t("cleanup.selectClass")}
+                </div>
+              ) : (
+                cleanupPreview.map((item) => (
+                  <div key={item.data_class} className="settings-row__description">
+                    {t("cleanup.previewLine", {
+                      dataClass: t(`cleanup.classes.${item.data_class}`),
+                      count: item.affected_count,
+                      size:
+                        item.data_class === "screenshots"
+                          ? formatBytes(item.bytes_freed)
+                          : "",
+                    })}
+                  </div>
+                ))
+              )}
+            </div>
             {dialogError && <Alert tone="danger">{dialogError}</Alert>}
           </div>
         </Dialog>

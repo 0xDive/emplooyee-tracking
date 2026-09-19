@@ -1,4 +1,6 @@
-# ActiLens
+<p align="center">
+  <img src="assets/brand/svg/lockup.svg" alt="ActiLens" width="420" />
+</p>
 
 ActiLens is a self-hosted workstation activity monitoring and analytics platform.
 

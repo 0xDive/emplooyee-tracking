@@ -15,6 +15,7 @@ import (
 	"actilens/backend/internal/store"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 )
 
 const (
@@ -37,12 +38,27 @@ func (h *OwnerHandler) CreateEnrollmentToken(c *gin.Context) {
 			return
 		}
 	}
+	var ttl time.Duration
 	if req.ExpiresInHours == 0 {
-		req.ExpiresInHours = defaultEnrollmentHours
+		business, err := h.store.GetBusiness(c.Request.Context(), c.Param("id"))
+		if err != nil {
+			if errors.Is(err, store.ErrNotFound) {
+				notFound(c, "organization not found")
+			} else {
+				serverError(c, err)
+			}
+			return
+		}
+		ttl = time.Duration(business.EnrollmentTokenTTLS) * time.Second
+	} else {
+		if req.ExpiresInHours < 1 || req.ExpiresInHours > maxEnrollmentHours {
+			badRequest(c, "expires_in_hours must be between 1 and 168")
+			return
+		}
+		ttl = time.Duration(req.ExpiresInHours) * time.Hour
 	}
-	if req.ExpiresInHours < 1 || req.ExpiresInHours > maxEnrollmentHours {
-		badRequest(c, "expires_in_hours must be between 1 and 168")
-		return
+	if ttl <= 0 {
+		ttl = defaultEnrollmentHours * time.Hour
 	}
 
 	token, hash, err := newEnrollmentToken()
@@ -50,7 +66,7 @@ func (h *OwnerHandler) CreateEnrollmentToken(c *gin.Context) {
 		serverError(c, err)
 		return
 	}
-	expiresAt := time.Now().UTC().Add(time.Duration(req.ExpiresInHours) * time.Hour)
+	expiresAt := time.Now().UTC().Add(ttl)
 	businessID, err := h.store.CreateEnrollmentToken(
 		c.Request.Context(), actorID, c.Param("id"), c.Param("user_id"), hash, expiresAt,
 	)
@@ -63,11 +79,19 @@ func (h *OwnerHandler) CreateEnrollmentToken(c *gin.Context) {
 			"expires_at":  expiresAt.Format(time.RFC3339),
 		})
 	case errors.Is(err, store.ErrNotFound):
-		c.JSON(http.StatusNotFound, gin.H{"error": "member not found"})
+		notFound(c, "member not found")
+	case errors.Is(err, store.ErrMemberBlocked):
+		apiError(c, http.StatusConflict, ErrCodeMemberBlocked, "member is blocked", nil)
+	case errors.Is(err, store.ErrMemberRemoved):
+		apiError(c, http.StatusConflict, ErrCodeMemberRemoved, "member was removed from this organization", nil)
+	case errors.Is(err, store.ErrOrganizationArchived):
+		apiError(c, http.StatusConflict, ErrCodeOrganizationArchived, "organization is archived", nil)
+	case errors.Is(err, store.ErrOrganizationDeletionPending):
+		apiError(c, http.StatusConflict, ErrCodeOrganizationDeletionPending, "organization deletion is pending", nil)
 	case errors.Is(err, store.ErrForbidden):
-		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient permission or member is disabled"})
+		forbidden(c, "insufficient permission")
 	case errors.Is(err, store.ErrConflict):
-		c.JSON(http.StatusConflict, gin.H{"error": "could not create enrollment token"})
+		apiError(c, http.StatusConflict, ErrCodeConflict, "could not create enrollment token", nil)
 	default:
 		serverError(c, err)
 	}
@@ -103,15 +127,23 @@ func (h *AuthHandler) Enroll(c *gin.Context) {
 		return
 	}
 
-	// Issue at the exact auth_version that was verified inside the locked redeem
-	// transaction. A concurrent password reset/disable makes this pair stale rather
-	// than accidentally upgrading the enrollment grant to a newer security version.
-	pair, err := h.tok.IssueVersioned(grant.User.ID, grant.AuthVersion)
+	// Enrollment creates a first-class desktop session bound to the enrolled
+	// organization. The device row itself is bound on the first sync when the
+	// client-generated device UUID is known.
+	sessionID := uuid.NewString()
+	pair, err := h.tok.IssueSessionVersioned(grant.User.ID, grant.AuthVersion, sessionID)
 	if err != nil {
 		serverError(c, err)
 		return
 	}
-	obs.Info("enrollment ok", "user", grant.User.ID, "business", grant.BusinessID)
+	if err := h.store.CreateAuthSession(
+		c.Request.Context(), grant.User.ID, sessionID, auth.HashToken(pair.RefreshToken),
+		"desktop", "Managed desktop", grant.AuthVersion, time.Now().UTC().Add(auth.RefreshTTL()),
+	); err != nil {
+		serverError(c, err)
+		return
+	}
+	obs.Info("enrollment ok", "user", grant.User.ID, "business", grant.BusinessID, "session", sessionID)
 	c.Header("Cache-Control", "no-store")
 	c.JSON(http.StatusOK, gin.H{
 		"user": gin.H{

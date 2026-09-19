@@ -10,7 +10,13 @@ async function probe() {
       const res = await fetch(`http://127.0.0.1:${port}/whoami`);
       if (res.ok) {
         const j = await res.json();
-        if (j && j.app === "actilens") return port;
+        if (j && j.app === "actilens") {
+          return {
+            port,
+            managed: !!j.managed,
+            browserTrackingEnabled: j.browser_tracking_enabled !== false,
+          };
+        }
       }
     } catch (_) {}
   }
@@ -18,12 +24,12 @@ async function probe() {
 }
 
 async function render() {
-  const port = await probe();
+  const link = await probe();
   const statusEl = $("status");
-  if (port) {
+  if (link) {
     statusEl.textContent = "Connected";
     statusEl.className = "pill ok";
-    $("port").textContent = String(port);
+    $("port").textContent = String(link.port);
   } else {
     statusEl.textContent = "App not found";
     statusEl.className = "pill bad";
@@ -47,11 +53,28 @@ async function render() {
   $("count").textContent = countDay === new Date().toDateString() ? count || 0 : 0;
 
   const { paused } = await chrome.storage.local.get("paused");
-  $("toggle").className = paused ? "switch off" : "switch";
-  $("toggle").setAttribute("aria-pressed", String(!paused));
+  const managed = !!link?.managed;
+  const policyEnabled = link?.browserTrackingEnabled !== false;
+  const effectivePaused = managed ? !policyEnabled : !!paused;
+  const toggle = $("toggle");
+
+  toggle.className = effectivePaused ? "switch off" : "switch";
+  toggle.setAttribute("aria-pressed", String(!effectivePaused));
+  toggle.disabled = managed || !policyEnabled;
+
+  const help = $("trackingHelp");
+  if (managed) {
+    help.textContent = policyEnabled
+      ? "Managed by your organization"
+      : "Disabled by your organization";
+  } else {
+    help.textContent = "Send active-tab activity to the local app";
+  }
 }
 
 $("toggle").addEventListener("click", async () => {
+  const link = await probe();
+  if (link?.managed || link?.browserTrackingEnabled === false) return;
   const { paused } = await chrome.storage.local.get("paused");
   await chrome.storage.local.set({ paused: !paused });
   render();

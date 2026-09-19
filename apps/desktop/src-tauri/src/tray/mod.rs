@@ -259,7 +259,10 @@ fn version_label(app: &AppHandle, loc: &str) -> String {
 /// tracking accordingly; on the dashboard tracking resumes and Start becomes usable.
 pub fn set_in_setup(app: &AppHandle, in_setup: bool) {
     IN_SETUP.store(in_setup, Ordering::Relaxed);
-    set_paused(app, in_setup);
+    if let Some(control) = app.try_state::<Arc<TrackerControl>>() {
+        control.in_setup.store(in_setup, Ordering::Relaxed);
+    }
+    refresh(app);
 }
 
 /// Show + focus the main window (it may be hidden in menu-bar-only mode).
@@ -274,6 +277,13 @@ pub fn show_main(app: &AppHandle) {
 /// tray indicator, and notifies the UI via an event.
 pub fn set_paused(app: &AppHandle, paused: bool) {
     if let Some(c) = app.try_state::<Arc<TrackerControl>>() {
+        // Organization-managed users cannot locally pause or resume policy.
+        // The server/membership switch remains authoritative.
+        if c.managed.load(Ordering::Relaxed) {
+            c.paused.store(false, Ordering::Relaxed);
+            refresh(app);
+            return;
+        }
         if !paused && !c.org_monitoring_enabled.load(Ordering::Relaxed) {
             refresh(app);
             return;
@@ -288,11 +298,11 @@ pub fn set_paused(app: &AppHandle, paused: bool) {
 pub fn refresh(app: &AppHandle) {
     let (paused, org_enabled, threshold) = match app.try_state::<Arc<TrackerControl>>() {
         Some(c) => (
-            c.paused.load(Ordering::Relaxed),
+            c.effective_paused(),
             c.org_monitoring_enabled.load(Ordering::Relaxed),
             c.idle_threshold_s.load(Ordering::Relaxed) as f64,
         ),
-        None => (false, true, 60.0),
+        None => (true, true, 60.0),
     };
     let state = if paused || !org_enabled {
         State::Paused
@@ -328,15 +338,20 @@ fn render(app: &AppHandle, state: State) {
     // Stop is available only while running (tracking/idle); Start only while
     // paused AND on the dashboard (never from the setup surfaces).
     let paused = state == State::Paused;
-    let org_enabled = app
+    let (org_enabled, managed) = app
         .try_state::<Arc<TrackerControl>>()
-        .map(|c| c.org_monitoring_enabled.load(Ordering::Relaxed))
-        .unwrap_or(true);
+        .map(|c| {
+            (
+                c.org_monitoring_enabled.load(Ordering::Relaxed),
+                c.managed.load(Ordering::Relaxed),
+            )
+        })
+        .unwrap_or((true, false));
     if let Some(items) = app.try_state::<MenuItems>() {
-        let _ = items
-            .start
-            .set_enabled(paused && org_enabled && !IN_SETUP.load(Ordering::Relaxed));
-        let _ = items.stop.set_enabled(!paused && org_enabled);
+        let _ = items.start.set_enabled(
+            !managed && paused && org_enabled && !IN_SETUP.load(Ordering::Relaxed),
+        );
+        let _ = items.stop.set_enabled(!managed && !paused && org_enabled);
     }
 }
 

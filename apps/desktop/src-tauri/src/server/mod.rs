@@ -123,12 +123,16 @@ fn gen_token() -> String {
 }
 
 async fn whoami(State(s): State<AppState>) -> Json<Value> {
-    // The extension reads the token here. A web page can't read this response
-    // (no CORS headers), and `/ingest` additionally rejects web origins + bad tokens.
+    // The extension reads the token + effective organization policy here. A web
+    // page can't read this response (no CORS headers), and /ingest also validates
+    // the loopback token/origin.
     Json(json!({
         "app": "actilens",
         "version": env!("CARGO_PKG_VERSION"),
         "token": *s.token,
+        "managed": s.control.managed.load(Ordering::Relaxed),
+        "browser_tracking_enabled": s.control.collect_browser_activity.load(Ordering::Relaxed)
+            && s.control.org_monitoring_enabled.load(Ordering::Relaxed),
     }))
 }
 
@@ -140,15 +144,21 @@ async fn ingest(
     if let Err(code) = check_request(&headers, s.token.as_str()) {
         return code;
     }
-    // On/off marker events are recorded unconditionally so an "off" transition still
-    // lands. Regular page views respect pause + domain-only privacy.
     let marker = is_marker(&v.url);
     if !s.control.org_monitoring_enabled.load(Ordering::Relaxed) {
         return StatusCode::OK;
     }
-    if !marker && s.control.paused.load(Ordering::Relaxed) {
-        // Tracking stopped: accept the request so the extension doesn't retry, but
-        // don't record anything (consistent with the keyboard/window trackers).
+
+    let managed = s.control.managed.load(Ordering::Relaxed);
+    // Browser popup pause markers are a local-only preference. In managed mode
+    // they cannot change organization policy and are not stored as browsing data.
+    if marker && managed {
+        return StatusCode::OK;
+    }
+    if !marker && !s.control.collect_browser_activity.load(Ordering::Relaxed) {
+        return StatusCode::OK;
+    }
+    if !marker && !managed && s.control.paused.load(Ordering::Relaxed) {
         return StatusCode::OK;
     }
     // Domain-only privacy mode: store just the origin, and drop the page title.

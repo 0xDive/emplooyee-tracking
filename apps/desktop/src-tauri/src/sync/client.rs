@@ -37,11 +37,17 @@ struct PublicBusinessesResp {
     businesses: Vec<PublicBusiness>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-struct MembershipState {
-    business_id: String,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MembershipState {
+    pub business_id: String,
+    #[serde(default)]
+    pub business_name: String,
+    #[serde(default)]
+    pub role: String,
+    #[serde(default)]
+    pub status: String,
     #[serde(default = "default_true")]
-    monitoring_enabled: bool,
+    pub monitoring_enabled: bool,
 }
 
 #[derive(Deserialize)]
@@ -55,10 +61,52 @@ fn default_true() -> bool {
 
 #[derive(Serialize)]
 struct LoginReq<'a> {
-    email: &'a str,
+    identifier: &'a str,
     password: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     business_id: Option<&'a str>,
+    client_type: &'static str,
+    client_label: &'static str,
+}
+
+#[derive(Serialize)]
+struct MFACompleteReq<'a> {
+    challenge_token: &'a str,
+    code: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    business_id: Option<&'a str>,
+    client_type: &'static str,
+    client_label: &'static str,
+}
+
+#[derive(Debug, Clone)]
+pub enum LoginAttempt {
+    Authenticated(Session),
+    MFARequired {
+        challenge_token: String,
+        business_id: Option<String>,
+    },
+    OrganizationRequired {
+        organizations: Vec<MembershipState>,
+    },
+}
+
+#[derive(Deserialize)]
+struct APIErrorBody {
+    #[serde(default)]
+    code: Option<String>,
+    #[serde(default)]
+    details: Option<APIErrorDetails>,
+}
+
+#[derive(Deserialize)]
+struct APIErrorDetails {
+    #[serde(default)]
+    challenge_token: Option<String>,
+    #[serde(default)]
+    business_id: Option<String>,
+    #[serde(default)]
+    organizations: Vec<MembershipState>,
 }
 
 #[derive(Deserialize)]
@@ -73,6 +121,8 @@ struct TokenResp {
 #[derive(Deserialize)]
 struct LoginResp {
     tokens: TokenResp,
+    #[serde(default)]
+    business_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -83,26 +133,51 @@ struct RefreshReq<'a> {
 /// `GET /v1/policy` — the org's capture policy for the signed-in employee.
 /// `managed` is false for standalone users (no org), in which case the desktop
 /// keeps its local defaults.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrivacyRule {
+    pub id: String,
+    pub kind: String,
+    pub match_type: String,
+    pub pattern: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct Policy {
     pub managed: bool,
     #[serde(default)]
+    pub business_id: Option<String>,
+    #[serde(default)]
+    pub archived: bool,
+    #[serde(default)]
     pub allow_employee_override: bool,
+    #[serde(default = "default_true")]
+    pub collect_app_activity: bool,
+    #[serde(default = "default_true")]
+    pub collect_window_titles: bool,
+    #[serde(default = "default_true")]
+    pub collect_screenshots: bool,
+    #[serde(default = "default_true")]
+    pub collect_browser_activity: bool,
+    #[serde(default = "default_true")]
+    pub collect_keystroke_counts: bool,
     #[serde(default)]
     pub screenshot_interval_s: Option<u64>,
     #[serde(default)]
     pub idle_threshold_s: Option<u64>,
     #[serde(default)]
     pub screenshot_retention_days: Option<u64>,
-    /// 'team' | 'family' — drives the onboarding copy (employee vs kid).
     #[serde(default)]
     pub kind: Option<String>,
-    /// "full_screen" | "active_window" — org-set screenshot capture mode.
+    #[serde(default)]
+    pub screenshot_capture_scope: Option<String>,
     #[serde(default)]
     pub screenshot_mode: Option<String>,
-    /// App names whose capture ticks are skipped entirely while frontmost.
     #[serde(default)]
     pub screenshot_skip_apps: Option<Vec<String>>,
+    #[serde(default)]
+    pub privacy_rules: Vec<PrivacyRule>,
 }
 
 /// One category of the backend's curated sensitive-app list
@@ -217,35 +292,122 @@ impl BackendClient {
         Ok(parsed.businesses)
     }
 
-    /// `POST /v1/auth/login`. On success returns the session (does NOT persist it —
-    /// the command stores it so the keychain write is explicit).
+    /// Password login. MFA-enabled accounts return a short-lived challenge instead
+    /// of creating a desktop session until the second factor succeeds.
     pub async fn login(
         &self,
-        email: &str,
+        identifier: &str,
         password: &str,
         business_id: Option<&str>,
-    ) -> Result<Session, String> {
+    ) -> Result<LoginAttempt, String> {
         let resp = self
             .http
             .post(self.url("/v1/auth/login"))
             .json(&LoginReq {
-                email,
+                identifier,
                 password,
                 business_id,
+                client_type: "desktop",
+                client_label: "ActiLens Desktop",
             })
             .send()
             .await
             .map_err(net_err)?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            if let Ok(parsed) = serde_json::from_str::<APIErrorBody>(&body) {
+                match (parsed.code.as_deref(), parsed.details) {
+                    (Some("mfa_required"), Some(details)) => {
+                        if let Some(challenge_token) = details.challenge_token {
+                            return Ok(LoginAttempt::MFARequired {
+                                challenge_token,
+                                business_id: details.business_id,
+                            });
+                        }
+                    }
+                    (Some("organization_required"), Some(details)) => {
+                        if !details.organizations.is_empty() {
+                            return Ok(LoginAttempt::OrganizationRequired {
+                                organizations: details.organizations,
+                            });
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            return Err(format_status_body(status, &body));
+        }
+
+        let parsed: LoginResp = resp.json().await.map_err(|e| e.to_string())?;
+        Ok(LoginAttempt::Authenticated(Session {
+            access_token: parsed.tokens.access_token,
+            refresh_token: parsed.tokens.refresh_token,
+            email: identifier.to_string(),
+            business_id: parsed
+                .business_id
+                .or_else(|| business_id.map(str::to_string)),
+        }))
+    }
+
+    pub async fn complete_mfa_login(
+        &self,
+        challenge_token: &str,
+        code: &str,
+        identifier: &str,
+        business_id: Option<&str>,
+    ) -> Result<Session, String> {
+        let resp = self
+            .http
+            .post(self.url("/v1/auth/mfa/complete"))
+            .json(&MFACompleteReq {
+                challenge_token,
+                code,
+                business_id,
+                client_type: "desktop",
+                client_label: "ActiLens Desktop",
+            })
+            .send()
+            .await
+            .map_err(net_err)?;
+
         if !resp.status().is_success() {
             return Err(status_err(resp).await);
         }
+
         let parsed: LoginResp = resp.json().await.map_err(|e| e.to_string())?;
         Ok(Session {
             access_token: parsed.tokens.access_token,
             refresh_token: parsed.tokens.refresh_token,
-            email: email.to_string(),
-            business_id: business_id.map(|s| s.to_string()),
+            email: identifier.to_string(),
+            business_id: parsed
+                .business_id
+                .or_else(|| business_id.map(str::to_string)),
         })
+    }
+
+    pub async fn memberships(&self) -> Result<Vec<MembershipState>, String> {
+        let mut token = self.access_token()?;
+        for attempt in 0..2 {
+            let resp = self
+                .http
+                .get(self.url("/v1/memberships/mine"))
+                .bearer_auth(&token)
+                .send()
+                .await
+                .map_err(net_err)?;
+            if resp.status() == reqwest::StatusCode::UNAUTHORIZED && attempt == 0 {
+                token = self.refresh().await?;
+                continue;
+            }
+            if !resp.status().is_success() {
+                return Err(status_err(resp).await);
+            }
+            let parsed: MembershipsResp = resp.json().await.map_err(|e| e.to_string())?;
+            return Ok(parsed.memberships);
+        }
+        Err("memberships: unreachable retry exhaustion".into())
     }
 
     /// `POST /v1/auth/refresh`. Updates the stored tokens in place on success.
@@ -314,14 +476,18 @@ impl BackendClient {
         Err("monitoring_enabled: unreachable retry exhaustion".into())
     }
 
-    /// `GET /v1/policy` with auto-refresh on 401.
-    pub async fn fetch_policy(&self) -> Result<Policy, String> {
+    /// `GET /v1/policy` with explicit organization scope and auto-refresh on 401.
+    pub async fn fetch_policy(&self, business_id: Option<&str>) -> Result<Policy, String> {
         let mut token = self.access_token()?;
         for attempt in 0..2 {
-            let resp = self
+            let mut request = self
                 .http
                 .get(self.url("/v1/policy"))
-                .bearer_auth(&token)
+                .bearer_auth(&token);
+            if let Some(id) = business_id {
+                request = request.query(&[("business_id", id)]);
+            }
+            let resp = request
                 .send()
                 .await
                 .map_err(net_err)?;
@@ -447,6 +613,9 @@ impl BackendClient {
             if let Some(d) = shot.display_id {
                 form = form.text("display_id", d.to_string());
             }
+            if let Some(group) = shot.capture_group_id.as_deref() {
+                form = form.text("capture_group_id", group.to_string());
+            }
             if let Some(b) = business_id {
                 form = form.text("business_id", b.to_string());
             }
@@ -483,6 +652,14 @@ impl BackendClient {
 /// these as "offline / backend down" → backoff, not a hard error.
 fn net_err(e: reqwest::Error) -> String {
     format!("network error: {e}")
+}
+
+fn format_status_body(status: reqwest::StatusCode, body: &str) -> String {
+    if body.is_empty() {
+        format!("backend returned {status}")
+    } else {
+        format!("backend returned {status}: {body}")
+    }
 }
 
 /// Turn a non-2xx response into a readable error, including the body if short.

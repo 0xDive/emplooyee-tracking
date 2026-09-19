@@ -11,7 +11,7 @@ use serde::Serialize;
 use tauri::State;
 
 use crate::platform::{self, CapabilityRow, Permission};
-use crate::storage::Db;
+use crate::storage::{Db, SyncTable};
 use crate::trackers::TrackerControl;
 
 /// Temporary smoke-test command kept from the scaffold; remove once real
@@ -62,13 +62,13 @@ pub fn track_event(
 
 #[tauri::command]
 pub fn is_paused(control: State<Arc<TrackerControl>>) -> bool {
-    control.paused.load(Ordering::Relaxed)
+    control.effective_paused()
 }
 
 /// Current tracking state for the UI: "tracking" | "idle" | "paused".
 #[tauri::command]
 pub fn tracking_state(control: State<Arc<TrackerControl>>) -> String {
-    if control.paused.load(Ordering::Relaxed) {
+    if control.effective_paused() {
         "paused"
     } else if platform::idle_seconds() >= control.idle_threshold_s.load(Ordering::Relaxed) as f64 {
         "idle"
@@ -157,6 +157,9 @@ pub fn set_settings(
     // state, so preserve both instead of letting serde defaults reset them.
     let current = state.current.lock().unwrap().clone();
     value.locale = current.locale;
+    value.last_managed_business_id = current.last_managed_business_id.clone();
+    value.collection_scope_dirty =
+        current.collection_scope_dirty || current.local_only || value.local_only;
     value.org_monitoring_enabled = if value.local_only {
         true
     } else {
@@ -169,7 +172,14 @@ pub fn set_settings(
         value.screenshot_interval_s = cur.screenshot_interval_s;
         value.idle_threshold_s = cur.idle_threshold_s;
         value.screenshot_retention_days = cur.screenshot_retention_days;
+        value.collect_app_activity = cur.collect_app_activity;
+        value.collect_window_titles = cur.collect_window_titles;
+        value.collect_browser_activity = cur.collect_browser_activity;
+        value.capture_screenshots = cur.capture_screenshots;
+        value.count_keystrokes = cur.count_keystrokes;
         value.screenshot_mode = cur.screenshot_mode;
+        value.screenshot_capture_scope = cur.screenshot_capture_scope;
+        value.screenshot_privacy_rules = cur.screenshot_privacy_rules;
         value.screenshot_skip_apps = cur.screenshot_skip_apps;
     }
     crate::settings::apply(&value, &control);
@@ -189,56 +199,25 @@ pub async fn apply_org_policy(
     control: State<'_, Arc<TrackerControl>>,
 ) -> Result<crate::settings::CaptureManaged, String> {
     let client = BackendClient::new(backend_url(), auth.inner().clone());
-    let policy = client.fetch_policy().await?;
-    let business_id = auth.session().and_then(|s| s.business_id);
-    let previous_monitoring = settings.managed.lock().unwrap().monitoring_enabled;
-    let monitoring_enabled = client
-        .monitoring_enabled(business_id.as_deref())
-        .await
-        .unwrap_or(previous_monitoring);
+    let business_id = auth.session().and_then(|session| session.business_id);
+    let policy = client.fetch_policy(business_id.as_deref()).await?;
 
-    control
-        .org_monitoring_enabled
-        .store(monitoring_enabled, Ordering::Relaxed);
-    {
-        let mut current = settings.current.lock().unwrap();
-        if current.org_monitoring_enabled != monitoring_enabled {
-            current.org_monitoring_enabled = monitoring_enabled;
-            let _ = crate::settings::save(&settings.path, &current);
-        }
-    }
-
-    let status = crate::settings::CaptureManaged {
-        managed: policy.managed,
-        allow_employee_override: policy.allow_employee_override,
-        family: policy.kind.as_deref() == Some("family"),
-        monitoring_enabled,
+    let previous = settings.managed.lock().unwrap().monitoring_enabled;
+    let monitoring_enabled = if policy.managed {
+        client
+            .monitoring_enabled(business_id.as_deref())
+            .await
+            .unwrap_or(previous)
+    } else {
+        true
     };
-    *settings.managed.lock().unwrap() = status;
 
-    if status.locked() {
-        let mut s = settings.current.lock().unwrap().clone();
-        if let Some(v) = policy.screenshot_interval_s {
-            s.screenshot_interval_s = v;
-        }
-        if let Some(v) = policy.idle_threshold_s {
-            s.idle_threshold_s = v;
-        }
-        // None retention = "keep forever" on the backend; leave the local value.
-        if let Some(v) = policy.screenshot_retention_days {
-            s.screenshot_retention_days = v;
-        }
-        if let Some(v) = policy.screenshot_mode {
-            s.screenshot_mode = v;
-        }
-        if let Some(v) = policy.screenshot_skip_apps {
-            s.screenshot_skip_apps = v;
-        }
-        crate::settings::apply(&s, &control);
-        let _ = crate::settings::save(&settings.path, &s);
-        *settings.current.lock().unwrap() = s;
-    }
-    Ok(status)
+    Ok(crate::settings::apply_managed_policy(
+        &settings,
+        &control,
+        &policy,
+        monitoring_enabled,
+    ))
 }
 
 /// Current org capture-policy status for the UI (to lock/unlock the controls).
@@ -453,7 +432,7 @@ fn err<E: std::fmt::Display>(e: E) -> String {
 // ---------- auth / session (task 51) ----------
 
 use crate::sync::auth::{AuthState, Session};
-use crate::sync::client::{BackendClient, PublicBusiness};
+use crate::sync::client::{BackendClient, LoginAttempt, MembershipState, PublicBusiness};
 
 /// The backend base URL (compile-time default; env override for dev).
 fn backend_url() -> String {
@@ -476,8 +455,125 @@ pub async fn list_businesses(
     client.list_businesses().await
 }
 
-/// Log in and persist the session to disk. Wrong credentials surface a clear error
-/// and store nothing.
+#[derive(Serialize)]
+pub struct DesktopLoginResult {
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session: Option<Session>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub challenge_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub business_id: Option<String>,
+    #[serde(default)]
+    pub organizations: Vec<MembershipState>,
+}
+
+fn managed_policy_rejects(message: &str) -> bool {
+    [
+        "member_blocked",
+        "member_removed",
+        "organization_archived",
+        "organization_deletion_pending",
+    ]
+    .iter()
+    .any(|code| message.contains(code))
+}
+
+fn suppress_pre_managed_backlog(db: &Db) -> Result<(), String> {
+    for table in [
+        SyncTable::Activity,
+        SyncTable::Keystroke,
+        SyncTable::Browser,
+        SyncTable::Screenshot,
+    ] {
+        db.suppress_pending(table).map_err(err)?;
+    }
+    Ok(())
+}
+
+async fn activate_authenticated_session(
+    session: Session,
+    auth: &Arc<AuthState>,
+    settings: &Arc<crate::settings::SettingsState>,
+    control: &Arc<TrackerControl>,
+    db: &Arc<Db>,
+) -> Result<DesktopLoginResult, String> {
+    let managed_business_id = session.business_id.clone();
+
+    if let Some(business_id) = managed_business_id.as_deref() {
+        let suppress = settings
+            .current
+            .lock()
+            .unwrap()
+            .needs_managed_scope_suppression(business_id);
+        if suppress {
+            // Privacy boundary: rows collected in personal/unbound mode or for a
+            // different organization remain local and are never silently uploaded.
+            suppress_pre_managed_backlog(db)?;
+        }
+    }
+
+    auth.store(session.clone())?;
+
+    if let Some(business_id) = managed_business_id.as_deref() {
+        control.managed.store(true, Ordering::Relaxed);
+        control
+            .org_monitoring_enabled
+            .store(false, Ordering::Relaxed);
+        {
+            let mut current = settings.current.lock().unwrap();
+            current.local_only = false;
+            current.last_managed_business_id = Some(business_id.to_string());
+            current.collection_scope_dirty = false;
+            current.org_monitoring_enabled = false;
+            let _ = crate::settings::save(&settings.path, &current);
+        }
+        {
+            let mut status = settings.managed.lock().unwrap();
+            status.managed = true;
+            status.allow_employee_override = false;
+            status.monitoring_enabled = false;
+        }
+
+        let client = BackendClient::new(backend_url(), auth.clone());
+        match client.fetch_policy(Some(business_id)).await {
+            Ok(policy) => {
+                let enabled = client
+                    .monitoring_enabled(Some(business_id))
+                    .await
+                    .unwrap_or(false);
+                crate::settings::apply_managed_policy(settings, control, &policy, enabled);
+            }
+            Err(e) => {
+                crate::log_warn!("policy", "initial managed policy fetch failed: {e}");
+            }
+        }
+    } else {
+        control.managed.store(false, Ordering::Relaxed);
+        control
+            .org_monitoring_enabled
+            .store(true, Ordering::Relaxed);
+        *settings.managed.lock().unwrap() = crate::settings::CaptureManaged::default();
+        let mut current = settings.current.lock().unwrap();
+        // Rows created by an authenticated-but-unbound account are still outside
+        // any organization privacy boundary and must not later flow into one.
+        current.collection_scope_dirty = true;
+        current.org_monitoring_enabled = true;
+        crate::settings::apply(&current, control);
+        let _ = crate::settings::save(&settings.path, &current);
+    }
+
+    Ok(DesktopLoginResult {
+        status: "authenticated".into(),
+        session: Some(session),
+        challenge_token: None,
+        business_id: None,
+        organizations: Vec::new(),
+    })
+}
+
+/// Password login. Multi-organization accounts select the governing organization
+/// before a session is created; MFA is completed in a separate command.
 #[tauri::command]
 pub async fn login(
     email: String,
@@ -486,43 +582,71 @@ pub async fn login(
     auth: State<'_, Arc<AuthState>>,
     settings: State<'_, Arc<crate::settings::SettingsState>>,
     control: State<'_, Arc<TrackerControl>>,
-) -> Result<Session, String> {
+    db: State<'_, Arc<Db>>,
+) -> Result<DesktopLoginResult, String> {
+    let client = BackendClient::new(backend_url(), auth.inner().clone());
+    match client
+        .login(&email, &password, business_id.as_deref())
+        .await?
+    {
+        LoginAttempt::Authenticated(session) => {
+            activate_authenticated_session(
+                session,
+                auth.inner(),
+                settings.inner(),
+                control.inner(),
+                db.inner(),
+            )
+            .await
+        }
+        LoginAttempt::MFARequired {
+            challenge_token,
+            business_id,
+        } => Ok(DesktopLoginResult {
+            status: "mfa_required".into(),
+            session: None,
+            challenge_token: Some(challenge_token),
+            business_id,
+            organizations: Vec::new(),
+        }),
+        LoginAttempt::OrganizationRequired { organizations } => Ok(DesktopLoginResult {
+            status: "organization_required".into(),
+            session: None,
+            challenge_token: None,
+            business_id: None,
+            organizations,
+        }),
+    }
+}
+
+#[tauri::command]
+pub async fn complete_mfa_login(
+    challenge_token: String,
+    code: String,
+    email: String,
+    business_id: Option<String>,
+    auth: State<'_, Arc<AuthState>>,
+    settings: State<'_, Arc<crate::settings::SettingsState>>,
+    control: State<'_, Arc<TrackerControl>>,
+    db: State<'_, Arc<Db>>,
+) -> Result<DesktopLoginResult, String> {
     let client = BackendClient::new(backend_url(), auth.inner().clone());
     let session = client
-        .login(&email, &password, business_id.as_deref())
+        .complete_mfa_login(
+            &challenge_token,
+            &code,
+            &email,
+            business_id.as_deref(),
+        )
         .await?;
-    auth.store(session.clone())?;
-
-    // Fail closed between authentication and membership-policy resolution. This
-    // prevents a completed onboarding session from collecting even a few local
-    // samples before the React policy effect runs.
-    control
-        .org_monitoring_enabled
-        .store(false, Ordering::Relaxed);
-    {
-        let mut current = settings.current.lock().unwrap();
-        current.org_monitoring_enabled = false;
-        let _ = crate::settings::save(&settings.path, &current);
-    }
-    settings.managed.lock().unwrap().monitoring_enabled = false;
-
-    // The login call itself just succeeded, so normally this resolves immediately.
-    // If the membership endpoint has a transient failure we intentionally stay
-    // disabled; the background sync/policy refresh will retry and re-enable only
-    // after the server explicitly says collection is allowed.
-    if let Ok(enabled) = client.monitoring_enabled(session.business_id.as_deref()).await {
-        control
-            .org_monitoring_enabled
-            .store(enabled, Ordering::Relaxed);
-        {
-            let mut current = settings.current.lock().unwrap();
-            current.org_monitoring_enabled = enabled;
-            let _ = crate::settings::save(&settings.path, &current);
-        }
-        settings.managed.lock().unwrap().monitoring_enabled = enabled;
-    }
-
-    Ok(session)
+    activate_authenticated_session(
+        session,
+        auth.inner(),
+        settings.inner(),
+        control.inner(),
+        db.inner(),
+    )
+    .await
 }
 
 /// Clear the stored session and release any organization-controlled
@@ -534,6 +658,7 @@ pub fn logout(
     control: State<Arc<TrackerControl>>,
 ) -> Result<(), String> {
     auth.clear()?;
+    control.in_setup.store(true, Ordering::Relaxed);
     control
         .org_monitoring_enabled
         .store(true, Ordering::Relaxed);
@@ -543,6 +668,7 @@ pub fn logout(
         crate::settings::save(&settings.path, &current).map_err(err)?;
     }
     *settings.managed.lock().unwrap() = crate::settings::CaptureManaged::default();
+    control.managed.store(false, Ordering::Relaxed);
     Ok(())
 }
 
@@ -554,8 +680,70 @@ pub async fn current_session(
     auth: State<'_, Arc<AuthState>>,
     settings: State<'_, Arc<crate::settings::SettingsState>>,
     control: State<'_, Arc<TrackerControl>>,
+    db: State<'_, Arc<Db>>,
 ) -> Result<Option<Session>, String> {
     if let Some(session) = auth.session() {
+        if let Some(business_id) = session.business_id.as_deref() {
+            let suppress = settings
+                .current
+                .lock()
+                .unwrap()
+                .needs_managed_scope_suppression(business_id);
+            if suppress {
+                suppress_pre_managed_backlog(db.inner())?;
+            }
+            {
+                let mut current = settings.current.lock().unwrap();
+                current.local_only = false;
+                current.last_managed_business_id = Some(business_id.to_string());
+                current.collection_scope_dirty = false;
+                let _ = crate::settings::save(&settings.path, &current);
+            }
+            control.managed.store(true, Ordering::Relaxed);
+            {
+                let mut managed = settings.managed.lock().unwrap();
+                managed.managed = true;
+                managed.allow_employee_override = false;
+                managed.monitoring_enabled =
+                    settings.current.lock().unwrap().org_monitoring_enabled;
+            }
+
+            let client = BackendClient::new(backend_url(), auth.inner().clone());
+            match client.fetch_policy(session.business_id.as_deref()).await {
+                Ok(policy) => {
+                    let previous = settings.managed.lock().unwrap().monitoring_enabled;
+                    let enabled = client
+                        .monitoring_enabled(session.business_id.as_deref())
+                        .await
+                        .unwrap_or(previous);
+                    crate::settings::apply_managed_policy(
+                        settings.inner(),
+                        control.inner(),
+                        &policy,
+                        enabled,
+                    );
+                }
+                Err(e) if managed_policy_rejects(&e) => {
+                    control
+                        .org_monitoring_enabled
+                        .store(false, Ordering::Relaxed);
+                    {
+                        let mut current = settings.current.lock().unwrap();
+                        current.org_monitoring_enabled = false;
+                        let _ = crate::settings::save(&settings.path, &current);
+                    }
+                    settings.managed.lock().unwrap().monitoring_enabled = false;
+                }
+                Err(e) => {
+                    crate::log_warn!("policy", "startup policy refresh failed: {e}");
+                }
+            }
+        } else {
+            control.managed.store(false, Ordering::Relaxed);
+            let mut current = settings.current.lock().unwrap();
+            current.collection_scope_dirty = true;
+            let _ = crate::settings::save(&settings.path, &current);
+        }
         return Ok(Some(session));
     }
 
@@ -584,25 +772,49 @@ pub async fn current_session(
         }
     };
 
+    // An enrollment creates the privacy boundary between personal/local history
+    // and organization-managed collection.
+    if let Some(business_id) = session.business_id.as_deref() {
+        let suppress = settings
+            .current
+            .lock()
+            .unwrap()
+            .needs_managed_scope_suppression(business_id);
+        if suppress {
+            suppress_pre_managed_backlog(db.inner())?;
+        }
+    }
+
     if let Err(e) = auth.store(session.clone()) {
         crate::log_warn!("enrollment", "could not persist enrolled session: {e}");
         return Err(e);
+    }
+    if let Some(business_id) = session.business_id.as_deref() {
+        let mut current = settings.current.lock().unwrap();
+        current.local_only = false;
+        current.last_managed_business_id = Some(business_id.to_string());
+        current.collection_scope_dirty = false;
+        current.org_monitoring_enabled = false;
+        let _ = crate::settings::save(&settings.path, &current);
     }
 
     // Do not keep the raw secret in this process after it has been consumed.
     std::env::remove_var("ACTILENS_ENROLL_TOKEN");
 
     let client = BackendClient::new(backend_url(), auth.inner().clone());
-    if let Ok(enabled) = client.monitoring_enabled(session.business_id.as_deref()).await {
-        control
-  .org_monitoring_enabled
-  .store(enabled, Ordering::Relaxed);
-        {
-  let mut current = settings.current.lock().unwrap();
-  current.org_monitoring_enabled = enabled;
-  let _ = crate::settings::save(&settings.path, &current);
+    control.managed.store(true, Ordering::Relaxed);
+    match client.fetch_policy(session.business_id.as_deref()).await {
+        Ok(policy) => {
+            let previous = settings.managed.lock().unwrap().monitoring_enabled;
+            let enabled = client
+                .monitoring_enabled(session.business_id.as_deref())
+                .await
+                .unwrap_or(previous);
+            crate::settings::apply_managed_policy(&settings, &control, &policy, enabled);
         }
-        settings.managed.lock().unwrap().monitoring_enabled = enabled;
+        Err(e) => {
+            crate::log_warn!("policy", "enrollment policy fetch failed: {e}");
+        }
     }
 
     Ok(Some(session))
